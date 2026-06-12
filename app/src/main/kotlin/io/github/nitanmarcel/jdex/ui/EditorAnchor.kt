@@ -1,4 +1,4 @@
-package org.example.ui
+package io.github.nitanmarcel.jdex.ui
 
 import io.github.andrewauclair.moderndocking.Dockable
 import io.github.andrewauclair.moderndocking.app.Docking
@@ -14,6 +14,8 @@ class EditorAnchor : JPanel(BorderLayout()), Dockable {
 
         add(RTextScrollPane(RSyntaxTextArea()), BorderLayout.CENTER)
     }
+
+    override fun isWrappableInScrollpane() = false
 
     override fun getPersistentID() = "editors"
 

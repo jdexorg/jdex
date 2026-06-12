@@ -1,4 +1,4 @@
-package org.example.ui
+package io.github.nitanmarcel.jdex.ui
 
 import com.formdev.flatlaf.FlatLightLaf
 import org.junit.jupiter.api.Assertions.assertEquals

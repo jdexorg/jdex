@@ -6,11 +6,18 @@ plugins {
 
 repositories {
     mavenCentral()
+    google()
 }
 
 dependencies {
+    implementation(libs.apksig)
+    implementation(libs.bined.swing)
+    implementation(libs.binary.data)
+    implementation(libs.binary.data.array)
     implementation(libs.flatlaf)
     implementation(libs.flatlaf.extras)
+    implementation(libs.jadx.core)
+    implementation(libs.jadx.dex.input)
     implementation(libs.kotlinx.coroutines.swing)
     implementation(libs.miglayout.swing)
     implementation(libs.moderndocking.single.app)
@@ -29,7 +36,7 @@ java {
 }
 
 application {
-    mainClass = "org.example.AppKt"
+    mainClass = "io.github.nitanmarcel.jdex.AppKt"
 }
 
 tasks.named<Test>("test") {

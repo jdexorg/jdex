@@ -1,4 +1,4 @@
-package org.example.project
+package io.github.nitanmarcel.jdex.project
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue

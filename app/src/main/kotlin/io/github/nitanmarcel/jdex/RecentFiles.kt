@@ -1,4 +1,4 @@
-package org.example
+package io.github.nitanmarcel.jdex
 
 import java.io.File
 import java.util.prefs.Preferences

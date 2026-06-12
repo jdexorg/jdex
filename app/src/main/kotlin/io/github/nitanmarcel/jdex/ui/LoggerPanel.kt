@@ -1,4 +1,4 @@
-package org.example.ui
+package io.github.nitanmarcel.jdex.ui
 
 import io.github.andrewauclair.moderndocking.Dockable
 import io.github.andrewauclair.moderndocking.app.Docking
@@ -37,6 +37,8 @@ class LoggerPanel : JPanel(BorderLayout()), Dockable {
             override fun close() = Unit
         })
     }
+
+    override fun isWrappableInScrollpane() = false
 
     override fun getPersistentID() = "logger"
 

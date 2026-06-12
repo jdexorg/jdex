@@ -1,7 +1,8 @@
-package org.example
+package io.github.nitanmarcel.jdex
 
 import com.formdev.flatlaf.FlatLightLaf
-import org.example.ui.MainWindow
+import io.github.nitanmarcel.jdex.ui.CodeTextArea
+import io.github.nitanmarcel.jdex.ui.MainWindow
 import java.util.logging.Logger
 import javax.swing.SwingUtilities
 
@@ -9,6 +10,7 @@ private val log = Logger.getLogger("jdex")
 
 fun main() {
     FlatLightLaf.setup()
+    CodeTextArea.registerSyntaxStyles()
     SwingUtilities.invokeLater {
         MainWindow().isVisible = true
         log.info("jdex started")
