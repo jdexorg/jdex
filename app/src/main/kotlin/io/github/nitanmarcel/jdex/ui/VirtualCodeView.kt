@@ -60,6 +60,8 @@ class VirtualCodeView(
     private val bookmarks: io.github.nitanmarcel.jdex.project.BookmarkStore = io.github.nitanmarcel.jdex.project.NoBookmarks,
     private val mainActivity: String? = null,
     private val onUsages: (Symbol) -> List<io.github.nitanmarcel.jdex.project.Usage>? = { null },
+    private val renames: io.github.nitanmarcel.jdex.project.Renames = io.github.nitanmarcel.jdex.project.Renames(),
+    private val onRenamed: () -> Unit = {},
 ) : JPanel(BorderLayout()) {
 
     private val commentCache = HashMap<String, String>()
@@ -139,8 +141,29 @@ class VirtualCodeView(
         hBar.blockIncrement = surface.width
     }
 
+    private fun rawLineText(index: Int): String =
+        source.lines(index, 1).firstOrNull() ?: ""
+
+    private fun displayLine(index: Int, raw: String): String =
+        if (!renames.hasAny()) raw else renames.display(raw, { source.sectionAt(index) }, { methodKeyAt(index) })
+
+    private fun methodKeyAt(index: Int): String? {
+        val section = source.sectionAt(index) ?: return null
+        val start = source.sectionStart(section) ?: return null
+        val from = maxOf(start, index - 600)
+        var shortId: String? = null
+        source.lines(from, index - from + 1).forEach {
+            val t = it.trimStart()
+            when {
+                t.startsWith(".method") -> shortId = t.substringAfterLast(' ').takeIf { s -> '(' in s }
+                t == ".end method" -> shortId = null
+            }
+        }
+        return shortId?.let { "L${section.replace('.', '/')};->$it" }
+    }
+
     private fun lineText(index: Int): String =
-        source.lines(index, 1).firstOrNull()?.replace("\t", "    ") ?: ""
+        displayLine(index, rawLineText(index)).replace("\t", "    ")
 
     private fun selection(): Pair<Pos, Pos>? {
         if (anchor == caret) return null
@@ -216,11 +239,22 @@ class VirtualCodeView(
             val lines = source.lines(topLine, visible)
             val sel = selection()
             var grew = maxWidth
+            val locals = renames.hasLocals()
+            var curMethod = if (locals) methodKeyAt(topLine) else null
 
             for (k in 0 until visible) {
                 val index = topLine + k
                 if (index >= source.lineCount) break
-                val line = (lines.getOrNull(k) ?: "").replace("\t", "    ")
+                val raw = lines.getOrNull(k) ?: ""
+                if (locals) {
+                    val t = raw.trimStart()
+                    when {
+                        t.startsWith("Class:") -> curMethod = null
+                        t.startsWith(".method") -> curMethod = t.substringAfterLast(' ').takeIf { '(' in it }?.let { "L${(source.sectionAt(index) ?: "").replace('.', '/')};->$it" }
+                        t == ".end method" -> curMethod = null
+                    }
+                }
+                val line = (if (!renames.hasAny()) raw else renames.display(raw, { source.sectionAt(index) }, { curMethod })).replace("\t", "    ")
                 val y = k * lineHeight
 
                 if (index == caret.line) {
@@ -248,7 +282,7 @@ class VirtualCodeView(
                     }
                 }
                 paintTokens(g, line, y + ascent)
-                anchorOf(line, index)?.let { anchor ->
+                anchorOf(raw, index)?.let { anchor ->
                     commentCache[anchor]?.let { c ->
                         g.color = commentColor
                         g.drawString("    ; $c", line.length * charWidth - xOffset, y + ascent)
@@ -330,8 +364,25 @@ class VirtualCodeView(
         }
     }
 
+    fun rerender() {
+        surface.repaint()
+        gutter.repaint()
+    }
+
+    private fun renameSymbol() {
+        if (!renames.active) return
+        val symbol = symbolAtCaret() ?: return
+        val key = symbol.renameKey ?: return
+        val original = symbol.simpleName
+        val current = renames.nameFor(key) ?: original ?: return
+        val input = JOptionPane.showInputDialog(this, "Rename ${symbol.kind.name.lowercase()}:", current) ?: return
+        val name = input.trim()
+        renames.store.setRename(key, if (name.isEmpty() || name == original) null else name)
+        onRenamed()
+    }
+
     private fun addComment() {
-        val anchor = anchorOf(lineText(caret.line), caret.line) ?: return
+        val anchor = anchorOf(rawLineText(caret.line), caret.line) ?: return
         val existing = commentCache[anchor] ?: ""
         val input = JOptionPane.showInputDialog(this, "Comment:", existing) ?: return
         val text = input.trim()
@@ -466,9 +517,23 @@ class VirtualCodeView(
         field.requestFocusInWindow()
     }
 
-    private fun symbolAtCaret(): Symbol? {
+    private fun symbolAtCaret(): Symbol? = displaySymbolAtCaret()?.let { renames.toRaw(it) }
+
+    private val registerToken = Regex("[vp]\\d+")
+
+    private fun localSymbolAt(line: String, col: Int): Symbol? {
+        val t = line.trimStart()
+        if (!(t.length >= 9 && t[8] == ':') && !t.startsWith(".local") && !t.startsWith(".param")) return null
+        val word = wordAt(line, col) ?: return null
+        val methodKey = methodKeyAt(caret.line) ?: return null
+        val register = if (registerToken.matches(word)) word else renames.localRegister(methodKey, word) ?: return null
+        return Symbol(SymbolKind.LOCAL, "$methodKey#$register")
+    }
+
+    private fun displaySymbolAtCaret(): Symbol? {
         val line = lineText(caret.line)
         Symbol.at(line, caret.col)?.let { return it }
+        localSymbolAt(line, caret.col)?.let { return it }
 
         val trimmed = line.trimStart()
         if (!trimmed.startsWith(".method") && !trimmed.startsWith(".field") && !trimmed.startsWith("Class:")) return null
@@ -547,6 +612,7 @@ class VirtualCodeView(
         bind(KeyEvent.VK_ENTER, 0, "gotoDef") { goToDefinition() }
         bind(KeyEvent.VK_TAB, 0, "decompile") { decompile() }
         bind(KeyEvent.VK_SLASH, 0, "comment") { addComment() }
+        bind(KeyEvent.VK_N, 0, "rename") { renameSymbol() }
         bind('B'.code, shortcut, "bookmark") { toggleBookmark() }
         bind('A'.code, shortcut or KeyEvent.SHIFT_DOWN_MASK, "findAction") { findAction() }
         bind(KeyEvent.VK_LEFT, KeyEvent.ALT_DOWN_MASK, "back") { back() }
@@ -594,7 +660,8 @@ class VirtualCodeView(
             addSeparator()
             add(menuItem("Toggle Bookmark", 'B'.code, shortcut) { toggleBookmark() })
             add(menuItem("Show Bookmarks…") { showBookmarks() })
-            add(menuItem("Add / Edit Comment", KeyEvent.VK_SLASH, 0, enabled = anchorOf(lineText(caret.line), caret.line) != null) { addComment() })
+            add(menuItem("Add / Edit Comment", KeyEvent.VK_SLASH, 0, enabled = anchorOf(rawLineText(caret.line), caret.line) != null) { addComment() })
+            add(menuItem("Rename…", KeyEvent.VK_N, 0, enabled = symbol?.renameKey != null && renames.active) { renameSymbol() })
             addSeparator()
             add(menuItem("Find Action…", 'A'.code, shortcut or KeyEvent.SHIFT_DOWN_MASK) { findAction() })
             add(menuItem("Decompile to Java", KeyEvent.VK_TAB, 0) { decompile() })
@@ -869,10 +936,10 @@ class VirtualCodeView(
             loadMore.isEnabled = false
             loadAll.isEnabled = false
             background {
-                val found = source.findFrom(query, fromLine, limit, ignoreCase)
+                val found = source.findFrom(query, fromLine, limit, ignoreCase) { i, t -> displayLine(i, t) }
                 SwingUtilities.invokeLater {
                     val first = hits.isEmpty()
-                    found.forEach { hits.add(it); model.addElement("${it + 1}:  ${source.lines(it, 1).firstOrNull()?.trim() ?: ""}") }
+                    found.forEach { hits.add(it); model.addElement("${it + 1}:  ${displayLine(it, source.lines(it, 1).firstOrNull() ?: "").trim()}") }
                     complete = found.size < limit
                     loadMore.isEnabled = !complete
                     loadAll.isEnabled = !complete

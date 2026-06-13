@@ -28,7 +28,7 @@ interface LineSource : AutoCloseable {
     fun search(query: String, from: Int, forward: Boolean, ignoreCase: Boolean): Int?
 
     /** Up to [limit] lines at or after [fromLine] containing [query]. Resumable: pass last+1 to continue. */
-    fun findFrom(query: String, fromLine: Int, limit: Int, ignoreCase: Boolean): List<Int>
+    fun findFrom(query: String, fromLine: Int, limit: Int, ignoreCase: Boolean, transform: (Int, String) -> String = { _, t -> t }): List<Int>
 }
 
 class DiskLineSource private constructor(
@@ -112,7 +112,7 @@ class DiskLineSource private constructor(
         return null
     }
 
-    override fun findFrom(query: String, fromLine: Int, limit: Int, ignoreCase: Boolean): List<Int> {
+    override fun findFrom(query: String, fromLine: Int, limit: Int, ignoreCase: Boolean, transform: (Int, String) -> String): List<Int> {
         if (query.isEmpty() || fromLine >= lineCount || fromLine < 0) return emptyList()
         val result = ArrayList<Int>()
         val idx = (fromLine / stride).coerceIn(0, offsets.size - 1)
@@ -123,7 +123,7 @@ class DiskLineSource private constructor(
                 while (line < fromLine) { reader.readLine() ?: return result; line++ }
                 while (result.size < limit) {
                     val text = reader.readLine() ?: break
-                    if (text.contains(query, ignoreCase)) result.add(line)
+                    if (transform(line, text).contains(query, ignoreCase)) result.add(line)
                     line++
                 }
             }

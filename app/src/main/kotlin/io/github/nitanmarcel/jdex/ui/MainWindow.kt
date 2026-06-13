@@ -19,7 +19,9 @@ import io.github.nitanmarcel.jdex.project.Content
 import io.github.nitanmarcel.jdex.project.HMembers
 import io.github.nitanmarcel.jdex.project.NoBookmarks
 import io.github.nitanmarcel.jdex.project.NoComments
+import io.github.nitanmarcel.jdex.project.NoRenames
 import io.github.nitanmarcel.jdex.project.Project
+import io.github.nitanmarcel.jdex.project.Renames
 import io.github.nitanmarcel.jdex.project.TextContent
 import java.awt.Dimension
 import java.awt.Toolkit
@@ -51,7 +53,9 @@ class MainWindow : JFrame("jdex") {
     private lateinit var hierarchy: HierarchyPanel
     private var project: Project? = null
     private var session: ApkSession? = null
+    private val renames = Renames()
     private var javaTab: EditorTab? = null
+    private var javaClass: String? = null
     private var bytecodeTab: EditorTab? = null
     private var bytecodeView: VirtualCodeView? = null
 
@@ -79,8 +83,10 @@ class MainWindow : JFrame("jdex") {
             onClass = { rawName -> navigateBytecode { it.revealClass(rawName) } },
             onMethod = { rawName, shortId -> navigateBytecode { it.revealMethod(rawName, shortId) } },
             onField = { rawName, name -> navigateBytecode { it.revealField(rawName, name) } },
-            onDecompile = { fullName -> showJava(fullName) },
-            loadMembers = { fullName -> session?.members(fullName) ?: HMembers(emptyList(), emptyList(), emptyMap(), emptyList()) },
+            onDecompile = { rawName -> showJava(rawName) },
+            loadMembers = { rawName -> session?.members(rawName) ?: HMembers(emptyList(), emptyList(), emptyMap(), emptyList()) },
+            renames = renames,
+            onRenamed = { renamesChanged() },
         )
         val logger = LoggerPanel()
 
@@ -166,8 +172,11 @@ class MainWindow : JFrame("jdex") {
         session = null
         clearEditors()
         project?.close()
+        renames.store = NoRenames
         val project = if (file.extension == Project.EXTENSION) Project.open(file) else Project.forInput(file)
         this.project = project
+        renames.store = project
+        renames.reload()
         recentFiles.add(file)
         updateRecentMenu()
         saveItem.isEnabled = true
@@ -230,6 +239,8 @@ class MainWindow : JFrame("jdex") {
                         bookmarks = project ?: NoBookmarks,
                         mainActivity = session?.mainActivity(),
                         onUsages = { symbol -> session?.usages(symbol) },
+                        renames = renames,
+                        onRenamed = { renamesChanged() },
                     )
                     val tab = EditorTab(tabId, title, view, source)
                     openTabs[tabId] = tab
@@ -260,6 +271,20 @@ class MainWindow : JFrame("jdex") {
             Docking.deregisterDockable(it)
         }
         javaTab = null
+        javaClass = null
+    }
+
+    private fun renamesChanged() {
+        renames.reload()
+        bytecodeView?.rerender()
+        hierarchy.refresh()
+        refreshJava()
+    }
+
+    private fun refreshJava() {
+        val cls = javaClass ?: return
+        val tab = javaTab ?: return
+        if (Docking.isDocked(tab)) showJava(cls)
     }
 
     private fun findInBytecode(query: String) {
@@ -277,8 +302,12 @@ class MainWindow : JFrame("jdex") {
 
     private fun showJava(className: String) {
         val session = session ?: return
+        javaClass = className
         scope.launch {
-            val result = withContext(Dispatchers.Default) { session.decompile(className) } ?: return@launch
+            val result = withContext(Dispatchers.Default) {
+                session.syncRenames(renames.snapshot())
+                session.decompile(className)
+            } ?: return@launch
             javaTab?.let {
                 if (Docking.isDocked(it)) Docking.undock(it)
                 Docking.deregisterDockable(it)

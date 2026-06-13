@@ -1,6 +1,6 @@
 package io.github.nitanmarcel.jdex.project
 
-enum class SymbolKind { TYPE, METHOD, FIELD, STRING, RESOURCE }
+enum class SymbolKind { TYPE, METHOD, FIELD, STRING, RESOURCE, LOCAL }
 
 class Usage(val display: String, val rawName: String, val shortId: String?, val fieldName: String?)
 
@@ -14,7 +14,7 @@ data class Symbol(val kind: SymbolKind, val text: String) {
         get() = when (kind) {
             SymbolKind.TYPE -> text
             SymbolKind.METHOD, SymbolKind.FIELD -> text.substringBefore("->", "").ifEmpty { null }
-            SymbolKind.STRING, SymbolKind.RESOURCE -> null
+            SymbolKind.STRING, SymbolKind.RESOURCE, SymbolKind.LOCAL -> null
         }
 
     val member: String?
@@ -22,6 +22,22 @@ data class Symbol(val kind: SymbolKind, val text: String) {
 
     fun declaringClassName(): String? =
         declaringType?.removePrefix("L")?.removeSuffix(";")?.replace('/', '.')
+
+    val renameKey: String?
+        get() = when (kind) {
+            SymbolKind.TYPE, SymbolKind.METHOD, SymbolKind.LOCAL -> text
+            SymbolKind.FIELD -> text.substringBefore(':')
+            SymbolKind.STRING, SymbolKind.RESOURCE -> null
+        }
+
+    val simpleName: String?
+        get() = when (kind) {
+            SymbolKind.TYPE -> text.removePrefix("L").removeSuffix(";").substringAfterLast('/')
+            SymbolKind.METHOD -> member?.substringBefore('(')
+            SymbolKind.FIELD -> member?.substringBefore(':')
+            SymbolKind.LOCAL -> text.substringAfterLast('#')
+            SymbolKind.STRING, SymbolKind.RESOURCE -> null
+        }
 
     companion object {
         private val STRING = Regex(""""(\\.|[^"\\])*"""")

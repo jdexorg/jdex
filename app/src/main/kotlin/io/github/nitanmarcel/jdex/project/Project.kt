@@ -5,7 +5,30 @@ import java.security.MessageDigest
 import java.sql.Connection
 import java.sql.DriverManager
 
-class Project private constructor(val file: File, private val connection: Connection) : AutoCloseable, CommentStore, BookmarkStore {
+class Project private constructor(val file: File, private val connection: Connection) : AutoCloseable, CommentStore, BookmarkStore, RenameStore {
+
+    override fun renames(): Map<String, String> {
+        val map = LinkedHashMap<String, String>()
+        connection.createStatement().use { st ->
+            st.executeQuery("SELECT key, name FROM rename").use { rs ->
+                while (rs.next()) map[rs.getString(1)] = rs.getString(2)
+            }
+        }
+        return map
+    }
+
+    override fun setRename(key: String, name: String?) {
+        if (name.isNullOrBlank()) {
+            connection.prepareStatement("DELETE FROM rename WHERE key = ?").use { it.setString(1, key); it.executeUpdate() }
+        } else {
+            connection.prepareStatement("INSERT OR REPLACE INTO rename(key, name) VALUES(?, ?)").use {
+                it.setString(1, key)
+                it.setString(2, name)
+                it.executeUpdate()
+            }
+        }
+        save()
+    }
 
     override fun toggle(line: Int): Boolean {
         val exists = connection.prepareStatement("SELECT 1 FROM bookmark WHERE line = ?").use {
@@ -116,6 +139,10 @@ class Project private constructor(val file: File, private val connection: Connec
                 if (version < 4) {
                     statement.executeUpdate("CREATE TABLE bookmark(line INTEGER PRIMARY KEY)")
                     statement.executeUpdate("PRAGMA user_version = 4")
+                }
+                if (version < 5) {
+                    statement.executeUpdate("CREATE TABLE rename(key TEXT PRIMARY KEY, name TEXT NOT NULL)")
+                    statement.executeUpdate("PRAGMA user_version = 5")
                 }
             }
         }

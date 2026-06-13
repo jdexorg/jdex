@@ -6,15 +6,21 @@ import io.github.nitanmarcel.jdex.project.HClass
 import io.github.nitanmarcel.jdex.project.HField
 import io.github.nitanmarcel.jdex.project.HMembers
 import io.github.nitanmarcel.jdex.project.HMethod
+import io.github.nitanmarcel.jdex.project.Renames
 import java.awt.BorderLayout
+import java.awt.Component
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import javax.swing.JMenuItem
+import javax.swing.JOptionPane
 import javax.swing.JPanel
+import javax.swing.JPopupMenu
 import javax.swing.JScrollPane
 import javax.swing.JTree
 import javax.swing.event.TreeExpansionEvent
 import javax.swing.event.TreeWillExpandListener
 import javax.swing.tree.DefaultMutableTreeNode
+import javax.swing.tree.DefaultTreeCellRenderer
 import javax.swing.tree.DefaultTreeModel
 
 class HierarchyPanel(
@@ -23,11 +29,13 @@ class HierarchyPanel(
     private val onField: (rawName: String, name: String) -> Unit,
     private val onDecompile: (fullName: String) -> Unit,
     private val loadMembers: (fullName: String) -> HMembers,
+    private val renames: Renames = Renames(),
+    private val onRenamed: () -> Unit = {},
 ) : JPanel(BorderLayout()), Dockable {
 
     private val root = DefaultMutableTreeNode()
     private val model = DefaultTreeModel(root)
-    private val tree = JTree(model).apply { isRootVisible = false; showsRootHandles = true }
+    private val tree = JTree(model).apply { isRootVisible = false; showsRootHandles = true; cellRenderer = RenameRenderer() }
 
     init {
         Docking.registerDockable(this)
@@ -54,9 +62,38 @@ class HierarchyPanel(
             override fun mouseClicked(e: MouseEvent) {
                 if (e.clickCount != 2) return
                 ((tree.getPathForLocation(e.x, e.y)?.lastPathComponent as? DefaultMutableTreeNode)?.userObject as? HClass)
-                    ?.let { onDecompile(it.fullName) }
+                    ?.let { onDecompile(it.rawName) }
+            }
+
+            override fun mousePressed(e: MouseEvent) = popup(e)
+            override fun mouseReleased(e: MouseEvent) = popup(e)
+
+            private fun popup(e: MouseEvent) {
+                if (!e.isPopupTrigger) return
+                val path = tree.getPathForLocation(e.x, e.y) ?: return
+                tree.selectionPath = path
+                val obj = (path.lastPathComponent as? DefaultMutableTreeNode)?.userObject
+                if (renames.active && (obj is HClass || obj is HMethod || obj is HField)) {
+                    JPopupMenu().apply {
+                        add(JMenuItem("Rename…").apply { addActionListener { renameNode(obj) } })
+                    }.show(tree, e.x, e.y)
+                }
             }
         })
+    }
+
+    private fun renameNode(obj: Any) {
+        val (key, original) = when (obj) {
+            is HClass -> classKey(obj.rawName) to obj.rawName.substringAfterLast('.')
+            is HMethod -> "${classKey(obj.declaringRawName)}->${obj.shortId}" to obj.shortId.substringBefore('(')
+            is HField -> "${classKey(obj.declaringRawName)}->${obj.name}" to obj.name
+            else -> return
+        }
+        val current = renames.nameFor(key) ?: original
+        val input = JOptionPane.showInputDialog(this, "Rename:", current) ?: return
+        val name = input.trim()
+        renames.store.setRename(key, if (name.isEmpty() || name == original) null else name)
+        onRenamed()
     }
 
     fun clear() {
@@ -87,7 +124,7 @@ class HierarchyPanel(
         if (node.loaded) return
         node.loaded = true
         node.removeAllChildren()
-        val members = loadMembers((node.userObject as HClass).fullName)
+        val members = loadMembers((node.userObject as HClass).rawName)
         members.fields.forEach { node.add(DefaultMutableTreeNode(it)) }
         members.methods.forEach { node.add(MethodTreeNode(it, members.innersByMethod[it.shortId] ?: emptyList())) }
         members.looseInners.forEach { node.add(ClassTreeNode(it)) }
@@ -142,6 +179,30 @@ class HierarchyPanel(
 
         init {
             if (inners.isNotEmpty()) add(DefaultMutableTreeNode("…"))
+        }
+    }
+
+    private fun classKey(rawName: String) = "L${rawName.replace('.', '/')};"
+
+    fun refresh() = tree.repaint()
+
+    private inner class RenameRenderer : DefaultTreeCellRenderer() {
+        override fun getTreeCellRendererComponent(
+            tree: JTree, value: Any?, sel: Boolean, expanded: Boolean, leaf: Boolean, row: Int, hasFocus: Boolean,
+        ): Component {
+            super.getTreeCellRendererComponent(tree, value, sel, expanded, leaf, row, hasFocus)
+            when (val obj = (value as? DefaultMutableTreeNode)?.userObject) {
+                is HClass -> renames.nameFor(classKey(obj.rawName))?.let { text = it }
+                is HMethod -> renames.nameFor("${classKey(obj.declaringRawName)}->${obj.shortId}")?.let {
+                    val rest = obj.display.indexOf('(')
+                    text = if (rest >= 0) it + obj.display.substring(rest) else it
+                }
+                is HField -> renames.nameFor("${classKey(obj.declaringRawName)}->${obj.name}")?.let {
+                    val rest = obj.display.indexOf(' ')
+                    text = if (rest >= 0) it + obj.display.substring(rest) else it
+                }
+            }
+            return this
         }
     }
 

@@ -57,7 +57,6 @@ class ApkSession private constructor(
         }
     }
 
-    private val classesByName by lazy { jadx.classesWithInners.associateBy { it.fullName } }
     private val classesByRawName by lazy { jadx.classesWithInners.associateBy { it.rawName } }
 
     fun usages(symbol: Symbol): List<Usage>? {
@@ -90,18 +89,48 @@ class ApkSession private constructor(
 
     class Decompiled(val title: String, val code: String)
 
+    private val appliedRenames = HashMap<String, String>()
+
+    fun syncRenames(map: Map<String, String>) {
+        for (key in appliedRenames.keys + map.keys) {
+            val desired = map[key]
+            if (appliedRenames[key] == desired) continue
+            runCatching { applyAlias(key, desired) }
+            if (desired == null) appliedRenames.remove(key) else appliedRenames[key] = desired
+        }
+    }
+
+    private fun applyAlias(key: String, name: String?) {
+        val rawName = key.substringBefore("->").removePrefix("L").removeSuffix(";").replace('/', '.')
+        val cls = classesByRawName[rawName] ?: return
+        when {
+            "->" !in key -> if (name == null) cls.removeAlias() else cls.classNode.classInfo.changeShortName(name)
+            '(' in key.substringAfter("->") -> {
+                val shortId = key.substringAfter("->")
+                cls.searchMethodByShortId(shortId)?.methodNode?.methodInfo?.setAlias(name ?: shortId.substringBefore('('))
+            }
+            else -> {
+                val fieldName = key.substringAfter("->")
+                cls.fields.firstOrNull { it.name == fieldName }?.fieldNode?.fieldInfo?.setAlias(name ?: fieldName)
+            }
+        }
+    }
+
     fun decompile(name: String): Decompiled? {
-        val cls = classesByName[name] ?: return null
+        val cls = classesByRawName[name] ?: return null
         val top = cls.topParentClass
-        val code = runCatching { top.code }.getOrElse { "// failed to decompile $name: ${it.message}" }
+        val code = runCatching {
+            if (appliedRenames.isNotEmpty()) top.reload()
+            top.code
+        }.getOrElse { "// failed to decompile $name: ${it.message}" }
         return Decompiled(top.fullName.substringAfterLast('.'), code)
     }
 
     fun topClasses(): List<HClass> =
         jadx.classes.map { HClass(it.rawName, it.fullName, it.getPackage(), it.name) }
 
-    fun members(fullName: String): HMembers {
-        val cls = classesByName[fullName] ?: return HMembers(emptyList(), emptyList(), emptyMap(), emptyList())
+    fun members(rawName: String): HMembers {
+        val cls = classesByRawName[rawName] ?: return HMembers(emptyList(), emptyList(), emptyMap(), emptyList())
         val raw = cls.rawName
         val fields = runCatching {
             cls.fields.map { HField("${it.name} : ${simpleName(it.type.toString())}", it.name, raw) }
