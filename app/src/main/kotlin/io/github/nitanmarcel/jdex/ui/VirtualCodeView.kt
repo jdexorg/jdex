@@ -64,6 +64,7 @@ class VirtualCodeView(
     private val renames: io.github.nitanmarcel.jdex.project.Renames = io.github.nitanmarcel.jdex.project.Renames(),
     private val onRenamed: () -> Unit = {},
     private val onCaret: (target: SyncTarget) -> Unit = {},
+    private val cfgProvider: (rawName: String, shortId: String) -> io.github.nitanmarcel.jdex.project.MethodCfg? = { _, _ -> null },
 ) : JPanel(BorderLayout()) {
 
     private val commentCache = HashMap<String, String>()
@@ -103,6 +104,8 @@ class VirtualCodeView(
     private val vBar = JScrollBar(JScrollBar.VERTICAL)
     private val hBar = JScrollBar(JScrollBar.HORIZONTAL)
     private var searchDialog: SearchDialog? = null
+    private val scrollArea: JPanel
+    private var graphView: GraphView? = null
 
     private val rethemeable = object : SyntaxThemes.Rethemeable {
         override fun retheme() {
@@ -137,7 +140,7 @@ class VirtualCodeView(
         commentCache.putAll(comments.all())
         bookmarkLines.addAll(bookmarks.bookmarks())
 
-        val scrollArea = JPanel(BorderLayout()).apply {
+        scrollArea = JPanel(BorderLayout()).apply {
             add(JPanel(BorderLayout()).apply { add(gutter, BorderLayout.WEST); add(surface, BorderLayout.CENTER) }, BorderLayout.CENTER)
             add(vBar, BorderLayout.EAST)
             add(hBar, BorderLayout.SOUTH)
@@ -219,6 +222,7 @@ class VirtualCodeView(
     }
 
     fun goToLine(line: Int, focusSurface: Boolean = true) {
+        if (graphView != null) showText()
         if (caret.line != line.coerceIn(0, source.lineCount - 1)) {
             backStack.addLast(caret.line)
             forwardStack.clear()
@@ -284,6 +288,7 @@ class VirtualCodeView(
     }
 
     fun followFromJava(target: SyncTarget) {
+        graphView?.let { if (it.followFromJava(target)) return else showText() }
         when (target) {
             is SyncTarget.ClassDecl ->
                 source.sectionStart(target.rawName)?.let { showSyncHighlight(it) }
@@ -340,6 +345,7 @@ class VirtualCodeView(
     fun clearSyncHighlight() {
         syncHighlightLine = null
         surface.repaint()
+        graphView?.clearSync()
     }
 
     private fun showSyncHighlight(line: Int) {
@@ -509,11 +515,13 @@ class VirtualCodeView(
     fun rerender() {
         surface.repaint()
         gutter.repaint()
+        graphView?.refresh()
     }
 
-    private fun renameSymbol() {
+    private fun renameSymbol() = symbolAtCaret()?.let { renameSymbol(it) }
+
+    private fun renameSymbol(symbol: Symbol) {
         if (!renames.active) return
-        val symbol = symbolAtCaret() ?: return
         val key = symbol.renameKey ?: return
         val original = symbol.simpleName
         val current = renames.nameFor(key) ?: original ?: return
@@ -754,6 +762,7 @@ class VirtualCodeView(
         bind(KeyEvent.VK_X, 0, "xrefs") { findUsages() }
         bind(KeyEvent.VK_ENTER, 0, "gotoDef") { goToDefinition() }
         bind(KeyEvent.VK_TAB, 0, "decompile") { decompile() }
+        bind(KeyEvent.VK_SPACE, 0, "toggleGraph") { toggleGraph() }
         bind(KeyEvent.VK_SLASH, 0, "comment") { addComment() }
         bind(KeyEvent.VK_N, 0, "rename") { renameSymbol() }
         bind('B'.code, shortcut, "bookmark") { toggleBookmark() }
@@ -794,6 +803,7 @@ class VirtualCodeView(
             add(menuItem("Copy Address", enabled = onInstruction) { copyAddress() })
             add(menuItem("Copy Reference", enabled = symbol != null) { copyReference() })
             add(menuItem("Select Method/Class", 'A'.code, shortcut) { selectEnclosing() })
+            add(menuItem("Graph View", KeyEvent.VK_SPACE, 0, enabled = currentMethod() != null) { showGraph() })
             addSeparator()
             add(menuItem("Find…", 'F'.code, shortcut) { openSearch() })
             add(menuItem("Find Usages", KeyEvent.VK_X, 0, enabled = symbol != null) { findUsages() })
@@ -862,6 +872,50 @@ class VirtualCodeView(
         source.sectionAt(caret.line)?.let(onDecompile)
     }
 
+    private fun currentMethod(): Pair<String, String>? {
+        val raw = source.sectionAt(caret.line) ?: return null
+        val shortId = methodKeyAt(caret.line)?.substringAfter("->") ?: return null
+        return raw to shortId
+    }
+
+    private fun toggleGraph() {
+        if (graphView != null) showText() else showGraph()
+    }
+
+    private fun showGraph() {
+        if (graphView != null) return
+        val (raw, shortId) = currentMethod() ?: return
+        val cfg = cfgProvider(raw, shortId) ?: return
+        val host = object : GraphHost {
+            override val renames get() = this@VirtualCodeView.renames
+            override val comments get() = this@VirtualCodeView.comments
+            override fun goToDefinition(symbol: Symbol) = this@VirtualCodeView.goToDefinition(symbol)
+            override fun findUsages(symbol: Symbol) = this@VirtualCodeView.findUsages(symbol)
+            override fun rename(symbol: Symbol) = this@VirtualCodeView.renameSymbol(symbol)
+            override fun openResource(type: String, name: String) = onResource(type, name)
+            override fun decompile(rawName: String) = onDecompile(rawName)
+            override fun reportCaret(target: SyncTarget) = onCaret(target)
+            override fun back() = showText()
+        }
+        val view = GraphView(cfg, raw, host)
+        graphView = view
+        remove(scrollArea)
+        add(view, BorderLayout.CENTER)
+        revalidate()
+        repaint()
+        view.requestFocusInWindow()
+    }
+
+    private fun showText() {
+        val view = graphView ?: return
+        graphView = null
+        remove(view)
+        add(scrollArea, BorderLayout.CENTER)
+        revalidate()
+        repaint()
+        surface.requestFocusInWindow()
+    }
+
     fun revealOffset(offset: Long) {
         val token = "%08x:".format(offset)
         background {
@@ -875,8 +929,9 @@ class VirtualCodeView(
         revealOffset(input.trim().removePrefix("0x").toLongOrNull(16) ?: return)
     }
 
-    private fun goToDefinition() {
-        val symbol = symbolAtCaret() ?: return
+    private fun goToDefinition() = symbolAtCaret()?.let { goToDefinition(it) }
+
+    private fun goToDefinition(symbol: Symbol) {
         if (symbol.kind == SymbolKind.RESOURCE) {
             val type = symbol.resourceType
             val name = symbol.resourceName
@@ -909,8 +964,9 @@ class VirtualCodeView(
         }
     }
 
-    private fun findUsages() {
-        val symbol = symbolAtCaret() ?: return
+    private fun findUsages() = symbolAtCaret()?.let { findUsages(it) }
+
+    private fun findUsages(symbol: Symbol) {
         background {
             val semantic = onUsages(symbol)
             if (semantic != null) {

@@ -26,6 +26,7 @@ dependencies {
     implementation(libs.graalpy.regex)
     implementation(libs.jadx.core)
     implementation(libs.jadx.dex.input)
+    implementation(libs.jungrapht.layout)
     implementation(libs.kotlinx.coroutines.swing)
     implementation(libs.miglayout.swing)
     implementation(libs.moderndocking.single.app)

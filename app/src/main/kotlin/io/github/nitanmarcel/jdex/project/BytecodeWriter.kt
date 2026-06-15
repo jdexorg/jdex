@@ -279,6 +279,96 @@ object BytecodeWriter {
             rows
         }
 
+    fun cfg(cls: JavaClass, shortId: String): MethodCfg? = withMethod(cls, shortId) { m -> buildCfg(m, shortId) }
+
+    private class RawInsn(val offset: Int, val addr: Int, val line: Int?, val name: String, val text: String, val target: Int?, val cases: List<Pair<Int, Int>>?)
+    private class TryRange(val start: Int, val end: Int, val handlers: List<Int>)
+
+    private fun buildCfg(m: IMethodData, shortId: String): MethodCfg {
+        val reader = m.codeReader ?: return MethodCfg(shortId, emptyList(), emptyList())
+        val isStatic = AccessFlags.hasFlag(m.accessFlags, AccessFlags.STATIC)
+        val ref = m.methodRef.apply { load() }
+        val insSize = (if (isStatic) 0 else 1) + ref.argTypes.sumOf { if (it == "J" || it == "D") 2 else 1 }
+        val paramBase = reader.registersCount - insSize
+        val codeBase = reader.codeOffset
+        val sourceLines = reader.debugInfo?.sourceLineMapping ?: emptyMap()
+
+        val raws = ArrayList<RawInsn>()
+        runCatching {
+            reader.visitInstructions { insn ->
+                insn.decode()
+                if (insn.rawOpcodeUnit == 0x0100 || insn.rawOpcodeUnit == 0x0200 || insn.rawOpcodeUnit == 0x0300) return@visitInstructions
+                val name = insn.opcode?.name ?: ""
+                val operands = operandText(insn, name, paramBase)
+                val text = (insn.opcodeMnemonic + (if (operands.isEmpty()) "" else " $operands") + comment(insn)).trimEnd()
+                val target = if (name.startsWith("GOTO") || name.startsWith("IF_")) insn.target else null
+                val cases = if (name == "PACKED_SWITCH" || name == "SPARSE_SWITCH") {
+                    (insn.payload as? ISwitchPayload)?.let { sw -> sw.keys.zip(sw.targets.toList()).map { (k, rel) -> k to (insn.offset + rel) } }
+                } else null
+                raws.add(RawInsn(insn.offset, codeBase + insn.offset * 2, sourceLines[insn.offset], name, text, target, cases))
+            }
+        }
+        if (raws.isEmpty()) return MethodCfg(shortId, emptyList(), emptyList())
+
+        val tries = ArrayList<TryRange>()
+        runCatching {
+            for (aTry in reader.tries) {
+                val catch = aTry.catch
+                val handlers = (catch.handlers?.toList() ?: emptyList()) +
+                    (if (catch.catchAllHandler >= 0) listOf(catch.catchAllHandler) else emptyList())
+                tries.add(TryRange(aTry.startOffset, aTry.endOffset, handlers.distinct()))
+            }
+        }
+
+        val offsetSet = raws.mapTo(HashSet()) { it.offset }
+        val nextOf = HashMap<Int, Int>()
+        raws.forEachIndexed { i, r -> nextOf[r.offset] = if (i + 1 < raws.size) raws[i + 1].offset else -1 }
+        fun next(off: Int) = nextOf[off]?.takeIf { it >= 0 }
+
+        val leaders = sortedSetOf(raws.first().offset)
+        for (r in raws) when {
+            r.name.startsWith("GOTO") -> { r.target?.let { leaders.add(it) }; next(r.offset)?.let { leaders.add(it) } }
+            r.name.startsWith("IF_") -> { r.target?.let { leaders.add(it) }; next(r.offset)?.let { leaders.add(it) } }
+            r.cases != null -> { r.cases.forEach { leaders.add(it.second) }; next(r.offset)?.let { leaders.add(it) } }
+            r.name.startsWith("RETURN") || r.name == "THROW" -> next(r.offset)?.let { leaders.add(it) }
+        }
+        for (t in tries) { leaders.add(t.start); if (t.end in offsetSet) leaders.add(t.end); t.handlers.forEach { leaders.add(it) } }
+        val leaderList = leaders.filter { it in offsetSet }
+
+        val idOf = HashMap<Int, Int>()
+        leaderList.forEachIndexed { i, off -> idOf[off] = i }
+        val rawByOffset = raws.associateBy { it.offset }
+        val blocks = leaderList.mapIndexed { i, start ->
+            val end = leaderList.getOrNull(i + 1) ?: Int.MAX_VALUE
+            CfgBlock(i, start, raws.filter { it.offset in start until end }.map { CfgInsn(it.offset, it.addr, it.line, it.text) })
+        }
+
+        val edges = LinkedHashSet<CfgEdge>()
+        fun add(from: Int, to: Int?, kind: CfgEdgeKind, label: String? = null) { if (to != null) edges.add(CfgEdge(from, to, kind, label)) }
+        for (b in blocks) {
+            val last = b.insns.lastOrNull()?.let { rawByOffset[it.offset] } ?: continue
+            val fall = leaderList.getOrNull(b.id + 1)?.let { idOf[it] }
+            when {
+                last.name.startsWith("GOTO") -> add(b.id, last.target?.let { idOf[it] }, CfgEdgeKind.GOTO)
+                last.name.startsWith("IF_") -> {
+                    add(b.id, last.target?.let { idOf[it] }, CfgEdgeKind.COND_TRUE)
+                    add(b.id, fall, CfgEdgeKind.COND_FALSE)
+                }
+                last.cases != null -> {
+                    last.cases.forEach { (key, off) -> add(b.id, idOf[off], CfgEdgeKind.SWITCH_CASE, "0x${key.toString(16)}") }
+                    add(b.id, fall, CfgEdgeKind.SWITCH_CASE, "default")
+                }
+                last.name.startsWith("RETURN") || last.name == "THROW" -> {}
+                else -> add(b.id, fall, CfgEdgeKind.FALLTHROUGH)
+            }
+        }
+        for (t in tries) for (b in blocks) {
+            val end = leaderList.getOrNull(b.id + 1) ?: (b.insns.last().offset + 1)
+            if (b.startOffset < t.end && end > t.start) t.handlers.forEach { add(b.id, idOf[it], CfgEdgeKind.EXCEPTION) }
+        }
+        return MethodCfg(shortId, blocks, edges.toList())
+    }
+
     fun stringRefs(cls: JavaClass): List<Pair<String, String>> {
         val data = cls.classNode?.clsData ?: return emptyList()
         val out = ArrayList<Pair<String, String>>()

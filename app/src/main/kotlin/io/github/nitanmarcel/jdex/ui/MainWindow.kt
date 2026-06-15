@@ -372,6 +372,7 @@ class MainWindow : JFrame("jdex") {
                         renames = renames,
                         onRenamed = { renamesChanged() },
                         onCaret = { target -> javaView?.followTo(target) },
+                        cfgProvider = { raw, shortId -> session?.methodCfg(raw, shortId) },
                     )
                     val tab = EditorTab(tabId, title, view, source)
                     openTabs[tabId] = tab

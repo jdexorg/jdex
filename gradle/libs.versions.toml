@@ -6,6 +6,7 @@ coroutines = "1.11.0"
 flatlaf = "3.7.1"
 graalpy = "25.0.2"
 jadx = "1.5.5"
+jungrapht = "1.4"
 junit-jupiter = "6.0.1"
 kotlin = "2.3.20"
 miglayout = "11.4.2"
@@ -29,6 +30,7 @@ graalpy-truffle-runtime = { module = "org.graalvm.truffle:truffle-runtime", vers
 graalpy-regex = { module = "org.graalvm.regex:regex", version.ref = "graalpy" }
 jadx-core = { module = "io.github.skylot:jadx-core", version.ref = "jadx" }
 jadx-dex-input = { module = "io.github.skylot:jadx-dex-input", version.ref = "jadx" }
+jungrapht-layout = { module = "com.github.tomnelson:jungrapht-layout", version.ref = "jungrapht" }
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit-jupiter" }
 kotlinx-coroutines-swing = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-swing", version.ref = "coroutines" }
 miglayout-swing = { module = "com.miglayout:miglayout-swing", version.ref = "miglayout" }

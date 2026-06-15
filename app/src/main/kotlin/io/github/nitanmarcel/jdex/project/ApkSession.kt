@@ -244,6 +244,9 @@ class ApkSession private constructor(
     fun methodInstructions(rawName: String, shortId: String): List<Map<String, Any?>>? =
         classNode(rawName)?.let { BytecodeWriter.instructions(it, shortId, resourceNames()) }
 
+    fun methodCfg(rawName: String, shortId: String): MethodCfg? =
+        classNode(rawName)?.let { BytecodeWriter.cfg(it, shortId) }
+
     fun classStrings(rawName: String): List<String> =
         classNode(rawName)?.let { BytecodeWriter.strings(it) } ?: emptyList()
 
