@@ -294,8 +294,11 @@ class MainWindow : JFrame("jdex") {
         clearEditors()
         project?.close()
         renames.store = NoRenames
-        val project = if (isProject) Project.open(file) else Project.forInput(file)
-        if (startFresh) project.resetContent()
+        val project = when {
+            isProject -> Project.open(file)
+            sibling != null && sibling.isFile && !startFresh -> Project.open(sibling)
+            else -> Project.forInput(file)
+        }
         this.project = project
         project.onDirty = { SwingUtilities.invokeLater { updateDirtyUi() } }
         renames.store = project
@@ -304,7 +307,7 @@ class MainWindow : JFrame("jdex") {
         updateRecentMenu()
         projectName = (project.input() ?: file).name
         updateDirtyUi()
-        log.info("Opened project ${project.file.absolutePath}")
+        log.info(project.file?.let { "Opened project ${it.absolutePath}" } ?: "Opened ${projectName} (unsaved project)")
         analyze()
     }
 
@@ -318,15 +321,18 @@ class MainWindow : JFrame("jdex") {
 
     private fun saveProject() {
         val p = project ?: return
+        if (p.isInMemory()) { saveProjectAs(); return }
         runCatching { p.save() }.onFailure { log.log(Level.WARNING, "Save failed", it) }
         updateDirtyUi()
     }
 
     private fun saveProjectAs() {
         val p = project ?: return
-        val chooser = JFileChooser(p.file.parentFile)
+        val input = p.input()
+        val dir = p.file?.parentFile ?: input?.parentFile ?: recentFiles.all().firstOrNull()?.parentFile
+        val chooser = JFileChooser(dir)
         chooser.fileFilter = FileNameExtensionFilter("jdex project (*.${Project.EXTENSION})", Project.EXTENSION)
-        chooser.selectedFile = p.file
+        chooser.selectedFile = p.file ?: File(dir, "${input?.nameWithoutExtension ?: "project"}.${Project.EXTENSION}")
         if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return
         var target = chooser.selectedFile
         if (!target.name.endsWith(".${Project.EXTENSION}")) target = File(target.path + ".${Project.EXTENSION}")
@@ -344,11 +350,14 @@ class MainWindow : JFrame("jdex") {
 
     private fun confirmDiscardChanges(): Boolean {
         val p = project ?: return true
-        if (!p.isDirty()) return true
+        if (!p.isDirty() && !p.isInMemory()) return true
+        val name = projectName ?: p.file?.name ?: "project"
+        val message = if (p.isInMemory()) "“$name” hasn't been saved to disk. Save it before closing?"
+            else "Save changes to $name?"
         val choice = JOptionPane.showOptionDialog(
             this,
-            "Save changes to ${projectName ?: p.file.name}?",
-            "Unsaved Changes",
+            message,
+            "Unsaved Project",
             JOptionPane.YES_NO_CANCEL_OPTION,
             JOptionPane.WARNING_MESSAGE,
             null,
@@ -356,7 +365,7 @@ class MainWindow : JFrame("jdex") {
             "Save",
         )
         return when (choice) {
-            JOptionPane.YES_OPTION -> { saveProject(); !p.isDirty() }
+            JOptionPane.YES_OPTION -> { saveProject(); !p.isDirty() && !p.isInMemory() }
             JOptionPane.NO_OPTION -> true
             else -> false
         }
@@ -372,7 +381,7 @@ class MainWindow : JFrame("jdex") {
         hierarchy.clear()
         log.info("Analyzing ${input.name}…")
         scope.launch {
-            runCatching { withContext(Dispatchers.Default) { ApkSession.load(input, project.file.name, project) } }
+            runCatching { withContext(Dispatchers.Default) { ApkSession.load(input, project.file?.name ?: input.name, project) } }
                 .onSuccess { loaded ->
                     session = loaded
                     explorer.show(loaded.root)

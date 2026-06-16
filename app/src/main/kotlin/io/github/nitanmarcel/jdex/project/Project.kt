@@ -5,9 +5,9 @@ import java.security.MessageDigest
 import java.sql.Connection
 import java.sql.DriverManager
 
-class Project private constructor(file: File, connection: Connection) : AutoCloseable, CommentStore, BookmarkStore, RenameStore, DexStore {
+class Project private constructor(file: File?, connection: Connection) : AutoCloseable, CommentStore, BookmarkStore, RenameStore, DexStore {
 
-    var file = file
+    var file: File? = file
         private set
     private var connection = connection
 
@@ -149,30 +149,29 @@ class Project private constructor(file: File, connection: Connection) : AutoClos
             }
         }
 
-    fun save() {
+    fun isInMemory() = file == null
+
+    fun save(): Boolean {
+        if (file == null) return false
         connection.commit()
         clearDirty()
+        return true
     }
 
     fun saveAs(target: File) {
-        if (target.absolutePath == file.absolutePath) { save(); return }
+        val current = file
+        if (current != null && target.absolutePath == current.absolutePath) { save(); return }
         connection.commit()
+        if (target.exists()) target.delete()
+        connection.autoCommit = true
+        connection.createStatement().use { it.executeUpdate("VACUUM INTO '${target.absolutePath.replace("'", "''")}'") }
         connection.close()
-        file.copyTo(target, overwrite = true)
         val nc = DriverManager.getConnection("jdbc:sqlite:${target.absolutePath}")
         migrate(nc)
         nc.autoCommit = false
         connection = nc
         file = target
         clearDirty()
-    }
-
-    fun resetContent() {
-        connection.createStatement().use { st ->
-            for (table in listOf("rename", "comment", "bookmark", "imported_dex", "dex_patch")) {
-                st.executeUpdate("DELETE FROM $table")
-            }
-        }
     }
 
     override fun close() {
@@ -190,11 +189,15 @@ class Project private constructor(file: File, connection: Connection) : AutoClos
             return Project(file, connection)
         }
 
-        fun forInput(input: File): Project =
-            open(input.resolveSibling("${input.nameWithoutExtension}.$EXTENSION")).apply {
+        fun forInput(input: File): Project {
+            val connection = DriverManager.getConnection("jdbc:sqlite::memory:")
+            migrate(connection)
+            connection.autoCommit = false
+            return Project(null, connection).apply {
                 setInput(input)
-                save()
+                connection.commit()
             }
+        }
 
         private fun migrate(connection: Connection) {
             connection.createStatement().use { statement ->
