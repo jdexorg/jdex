@@ -13,6 +13,10 @@ object Dex {
     fun isDex(bytes: ByteArray): Boolean =
         bytes.size >= 8 && MAGIC.indices.all { bytes[it] == MAGIC[it] }
 
+    fun looksLikeDex(bytes: ByteArray): Boolean =
+        bytes.size >= HEADER_SIZE &&
+            (isDex(bytes) || readInt(bytes, 0x28) == ENDIAN_TAG || readInt(bytes, 0x24) == HEADER_SIZE)
+
     fun parseBroken(bytes: ByteArray): Boolean {
         if (bytes.size < HEADER_SIZE) return true
         if (!validVersion(bytes)) return true

@@ -8,7 +8,7 @@ class ScriptApi(
     private val onChanged: () -> Unit = {},
     private val dexStore: () -> DexStore = { NoDexStore },
     private val onReanalyze: () -> Unit = {},
-    private val importer: (String, ByteArray) -> Unit = { _, _ -> },
+    private val fileImporter: (String, ByteArray) -> Unit = { _, _ -> },
     private val ui: ScriptUi = NoScriptUi,
 ) {
 
@@ -128,7 +128,7 @@ class ScriptApi(
 
     fun readFile(path: String): ByteArray = active().readFile(path)
 
-    fun importDex(name: String, bytes: ByteArray) = importer(name, bytes)
+    fun importFile(name: String, bytes: ByteArray) = fileImporter(name, bytes)
 
     fun uiMessage(text: String, error: Boolean) = ui.message(text, error)
 

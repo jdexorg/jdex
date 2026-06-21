@@ -422,7 +422,7 @@ class ApkSession private constructor(
         private val DEX = Regex("""classes\d*\.dex""")
         private val MAX_BYTES = 1 shl 20
 
-        fun load(input: File, projectName: String, dexStore: DexStore = NoDexStore): ApkSession {
+        fun load(input: File, projectName: String, dexStore: DexStore = NoDexStore, fileStore: FileStore = NoFileStore): ApkSession {
             val isApk = runCatching { ZipFile(input).use {} }.isSuccess
             val certificates = if (isApk) certificates(input) else emptyList()
 
@@ -445,6 +445,7 @@ class ApkSession private constructor(
             val res = mutableListOf<Pair<String, (() -> Content)?>>()
             val assets = mutableListOf<Pair<String, (() -> Content)?>>()
             val libs = mutableListOf<Pair<String, (() -> Content)?>>()
+            val imported = mutableListOf<Pair<String, (() -> Content)?>>()
             for (rf in resources) {
                 val name = rf.deobfName
                 when {
@@ -453,6 +454,17 @@ class ApkSession private constructor(
                     name.startsWith("lib/") -> libs += name.removePrefix("lib/") to nativeContent(input, rf)
                     name.startsWith("res/") -> res += name.removePrefix("res/") to fileContent(input, rf)
                     name == "resources.arsc" -> res += name to fileContent(input, rf)
+                }
+            }
+            fileStore.importedFiles().forEach { f ->
+                if (f.path.startsWith("lib/")) {
+                    val rel = f.path.removePrefix("lib/")
+                    libs.removeAll { it.first == rel }
+                    libs += rel to fileFromBytes(f.bytes, rel)
+                } else {
+                    val rel = f.path.removePrefix("unknown/")
+                    imported.removeAll { it.first == rel }
+                    imported += rel to fileFromBytes(f.bytes, rel)
                 }
             }
 
@@ -472,6 +484,7 @@ class ApkSession private constructor(
                 folder("Resources", res)?.let(::add)
                 folder("Assets", assets)?.let(::add)
                 folder("Libraries", libs)?.let(::add)
+                folder("unknown", imported)?.let(::add)
             }
 
             val container = appPackage?.let { ProjectNode(it, children = units) }
@@ -536,6 +549,22 @@ class ApkSession private constructor(
             if (io.github.nitanmarcel.jdex.disasm.ElfFile.parse(bytes) != null)
                 NativeContent(rf.deobfName.substringAfterLast('/'), bytes)
             else BinaryContent(bytes)
+        }
+
+        private fun fileFromBytes(bytes: ByteArray, path: String): () -> Content = {
+            if (io.github.nitanmarcel.jdex.disasm.ElfFile.parse(bytes) != null)
+                NativeContent(path.substringAfterLast('/'), bytes)
+            else BinaryContent(bytes)
+        }
+
+        fun abiFolder(arch: io.github.nitanmarcel.jdex.disasm.ElfArch): String? = when (arch) {
+            io.github.nitanmarcel.jdex.disasm.ElfArch.ARM64 -> "arm64-v8a"
+            io.github.nitanmarcel.jdex.disasm.ElfArch.ARM -> "armeabi-v7a"
+            io.github.nitanmarcel.jdex.disasm.ElfArch.X86 -> "x86"
+            io.github.nitanmarcel.jdex.disasm.ElfArch.X86_64 -> "x86_64"
+            io.github.nitanmarcel.jdex.disasm.ElfArch.MIPS -> "mips"
+            io.github.nitanmarcel.jdex.disasm.ElfArch.MIPS64 -> "mips64"
+            io.github.nitanmarcel.jdex.disasm.ElfArch.UNKNOWN -> null
         }
 
         private fun readEntryFull(input: File, name: String): ByteArray = runCatching {

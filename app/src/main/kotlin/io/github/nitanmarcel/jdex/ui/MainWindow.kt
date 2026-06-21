@@ -125,12 +125,7 @@ class MainWindow : JFrame("jdex") {
             onChanged = { SwingUtilities.invokeLater { renamesChanged() } },
             dexStore = { project ?: NoDexStore },
             onReanalyze = { SwingUtilities.invokeLater { analyze() } },
-            importer = { name, bytes ->
-                SwingUtilities.invokeLater {
-                    project?.let { it.saveImported(DexPatch.sha256(bytes), name, bytes); analyze() }
-                        ?: log.warning("Open an APK or project before importing a DEX")
-                }
-            },
+            fileImporter = { name, bytes -> SwingUtilities.invokeLater { importFile(name, bytes) } },
             ui = object : ScriptUi {
                 override fun message(text: String, error: Boolean) = SwingUtilities.invokeLater {
                     JOptionPane.showMessageDialog(
@@ -182,7 +177,7 @@ class MainWindow : JFrame("jdex") {
                 accelerator = shortcut(KeyEvent.VK_O)
                 addActionListener { openWithChooser() }
             })
-            add(JMenuItem("Import DEX…").apply { icon = Icons.FILE_BINARY; addActionListener { importDex() } })
+            add(JMenuItem("Import file…").apply { icon = Icons.FILE_BINARY; addActionListener { importFileChooser() } })
             add(JMenuItem("Run Script…").apply { icon = Icons.RUN; addActionListener { runScript() } })
             add(recentMenu)
             addSeparator()
@@ -391,7 +386,7 @@ class MainWindow : JFrame("jdex") {
         hierarchy.clear()
         log.info("Analyzing ${input.name}…")
         scope.launch {
-            runCatching { withContext(Dispatchers.Default) { ApkSession.load(input, project.file?.name ?: input.name, project) } }
+            runCatching { withContext(Dispatchers.Default) { ApkSession.load(input, project.file?.name ?: input.name, project, project) } }
                 .onSuccess { loaded ->
                     session = loaded
                     explorer.show(loaded.root)
@@ -417,16 +412,43 @@ class MainWindow : JFrame("jdex") {
         analyze()
     }
 
-    private fun importDex() {
-        val project = project ?: return run { log.warning("Open an APK or project before importing a DEX") }
+    private fun importFileChooser() {
+        if (project == null) { log.warning("Open an APK or project before importing a file"); return }
         val chooser = JFileChooser(recentFiles.all().firstOrNull()?.parentFile)
-        chooser.fileFilter = FileNameExtensionFilter("DEX files (*.dex)", "dex")
         if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return
         val file = chooser.selectedFile
         val bytes = runCatching { file.readBytes() }.getOrElse { log.log(Level.SEVERE, "Cannot read ${file.name}: ${it.message}"); return }
-        project.saveImported(DexPatch.sha256(bytes), file.name, bytes)
-        log.info("Imported ${file.name} (${bytes.size} bytes)")
+        importFile(file.name, bytes)
+    }
+
+    private fun importFile(name: String, bytes: ByteArray) {
+        val project = project ?: return run { log.warning("Open an APK or project before importing a file") }
+        val elf = io.github.nitanmarcel.jdex.disasm.ElfFile.parse(bytes)
+        if (elf == null && (Dex.looksLikeDex(bytes) || name.endsWith(".dex", ignoreCase = true))) {
+            project.saveImported(DexPatch.sha256(bytes), name, bytes)
+            log.info("Imported dex $name (${bytes.size} bytes)")
+            analyze()
+            return
+        }
+        val abi = elf?.let { ApkSession.abiFolder(it.arch) }
+        val path = if (abi != null) "lib/$abi/$name" else "unknown/$name"
+        if (nameExistsInProject(name)) {
+            val ok = JOptionPane.showConfirmDialog(
+                this, "$name already exists in this project. Override it?", "Import File",
+                JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE,
+            ) == JOptionPane.OK_OPTION
+            if (!ok) return
+        }
+        project.saveFile(path, bytes)
+        log.info("Imported $path (${bytes.size} bytes)")
         analyze()
+    }
+
+    private fun nameExistsInProject(name: String): Boolean {
+        val p = project ?: return false
+        val fromApk = session?.entryNames()?.any { it.substringAfterLast('/') == name } == true
+        val fromImported = p.importedFiles().any { it.path.substringAfterLast('/') == name }
+        return fromApk || fromImported
     }
 
     private fun runScript() {

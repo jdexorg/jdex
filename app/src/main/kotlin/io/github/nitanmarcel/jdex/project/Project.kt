@@ -5,7 +5,7 @@ import java.security.MessageDigest
 import java.sql.Connection
 import java.sql.DriverManager
 
-class Project private constructor(file: File?, connection: Connection) : AutoCloseable, CommentStore, BookmarkStore, RenameStore, DexStore {
+class Project private constructor(file: File?, connection: Connection) : AutoCloseable, CommentStore, BookmarkStore, RenameStore, DexStore, FileStore {
 
     var file: File? = file
         private set
@@ -45,6 +45,33 @@ class Project private constructor(file: File?, connection: Connection) : AutoClo
         connection.prepareStatement("INSERT OR REPLACE INTO dex_patch(source_sha, patch) VALUES(?, ?)").use {
             it.setString(1, sha)
             it.setBytes(2, patch.serialize())
+            it.executeUpdate()
+        }
+        markDirty()
+    }
+
+    override fun importedFiles(): List<StoredFile> {
+        val list = mutableListOf<StoredFile>()
+        connection.createStatement().use { st ->
+            st.executeQuery("SELECT path, bytes FROM imported_file").use { rs ->
+                while (rs.next()) list.add(StoredFile(rs.getString(1), rs.getBytes(2)))
+            }
+        }
+        return list
+    }
+
+    override fun saveFile(path: String, bytes: ByteArray) {
+        connection.prepareStatement("INSERT OR REPLACE INTO imported_file(path, bytes) VALUES(?, ?)").use {
+            it.setString(1, path)
+            it.setBytes(2, bytes)
+            it.executeUpdate()
+        }
+        markDirty()
+    }
+
+    override fun removeFile(path: String) {
+        connection.prepareStatement("DELETE FROM imported_file WHERE path = ?").use {
+            it.setString(1, path)
             it.executeUpdate()
         }
         markDirty()
@@ -231,6 +258,10 @@ class Project private constructor(file: File?, connection: Connection) : AutoClo
                     statement.executeUpdate("CREATE TABLE imported_dex(sha TEXT PRIMARY KEY, name TEXT NOT NULL, bytes BLOB NOT NULL)")
                     statement.executeUpdate("CREATE TABLE dex_patch(source_sha TEXT PRIMARY KEY, patch BLOB NOT NULL)")
                     statement.executeUpdate("PRAGMA user_version = 6")
+                }
+                if (version < 7) {
+                    statement.executeUpdate("CREATE TABLE imported_file(path TEXT PRIMARY KEY, bytes BLOB NOT NULL)")
+                    statement.executeUpdate("PRAGMA user_version = 7")
                 }
             }
         }

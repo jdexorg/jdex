@@ -265,9 +265,11 @@ class _Jdex:
         """Raw bytes of one APK entry by name; empty bytes if absent."""
         return self._host.readFile(str(path))
 
-    def import_dex(self, name, data):
-        """Add a dex (bytes) to the project under `name`, then re-analyze."""
-        self._host.importDex(str(name), data)
+    def import_file(self, name, data):
+        """Add a file (bytes) under `name`, type auto-detected: a dex is merged into
+        analysis; a native ELF is placed in its detected lib/<abi>/ folder; anything
+        else goes to 'unknown'. Asks to override if the name already exists."""
+        self._host.importFile(str(name), data)
 
     def classes(self):
         """All classes including inner classes."""
