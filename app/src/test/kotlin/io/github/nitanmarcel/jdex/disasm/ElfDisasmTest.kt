@@ -1537,20 +1537,18 @@ class ElfDisasmTest {
 
     @Test
     fun jniRealCronetAllArches() {
-        val apk = java.io.File("/home/nitanmarcel/Downloads/pinning-demo.apk")
-        assumeTrue(apk.exists(), "pinning-demo.apk not present")
-        java.util.zip.ZipFile(apk).use { zip ->
-            for (abi in listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")) {
-                val entry = zip.getEntry("lib/$abi/libcronet.119.0.6045.31.so") ?: continue
-                val bytes = zip.getInputStream(entry).use { it.readBytes() }
-                val elf = ElfFile.parse(bytes)!!
-                NativeFunctions.detectArmMode(elf, CapstoneDisassembler, elf.littleEndian)
-                val starts = NativeFunctions.discover(elf, CapstoneDisassembler, elf.arch, elf.littleEndian)
-                val jni = NativeJni.analyze(elf, CapstoneDisassembler, elf.arch, elf.littleEndian, starts)
-                assertTrue(jni.registered.size >= 100, "[$abi] real cronet should recover its registered natives, got ${jni.registered.size}")
-                assertTrue(jni.registered.values.all { it.signature.startsWith("(") }, "[$abi] all recovered signatures well-formed")
-            }
+        var checked = 0
+        for (abi in listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")) {
+            val bytes = javaClass.getResourceAsStream("/jni/cronet/$abi.so")?.readBytes() ?: continue
+            val elf = ElfFile.parse(bytes)!!
+            NativeFunctions.detectArmMode(elf, CapstoneDisassembler, elf.littleEndian)
+            val starts = NativeFunctions.discover(elf, CapstoneDisassembler, elf.arch, elf.littleEndian)
+            val jni = NativeJni.analyze(elf, CapstoneDisassembler, elf.arch, elf.littleEndian, starts)
+            assertTrue(jni.registered.size >= 100, "[$abi] real cronet should recover its registered natives, got ${jni.registered.size}")
+            assertTrue(jni.registered.values.all { it.signature.startsWith("(") }, "[$abi] all recovered signatures well-formed")
+            checked++
         }
+        assumeTrue(checked > 0, "cronet JNI corpus not present under test resources /jni/cronet/")
     }
 
     @Test

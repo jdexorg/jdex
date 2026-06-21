@@ -9,7 +9,10 @@ import java.io.File
 
 class ScriptEngineTest {
 
-    private val apk = File(System.getProperty("user.home"), "Downloads/pinning-demo.apk")
+    private val apk: File = File.createTempFile("jdex-fixture", ".apk").apply {
+        deleteOnExit()
+        outputStream().use { out -> ScriptEngineTest::class.java.getResourceAsStream("/fixtures/jdex-debug-target.apk")!!.use { it.copyTo(out) } }
+    }
 
     @Test
     fun objectModelNavigatesOffsetsAndRenames() {
