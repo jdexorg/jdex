@@ -23,9 +23,14 @@ object BytecodeWriter {
 
     private const val MNEMONIC_WIDTH = 20
 
-    fun forClass(cls: JavaClass, resources: Map<Int, String>): String {
-        val data = cls.classNode?.clsData ?: return "Class: L${cls.rawName.replace('.', '/')};\n"
-        val out = StringBuilder()
+    class BytecodeListing(val text: String, val offsetLines: IntArray, val dexPcs: IntArray)
+
+    fun forClass(cls: JavaClass, resources: Map<Int, String>): String = forClassListing(cls, resources).text
+
+    fun forClassListing(cls: JavaClass, resources: Map<Int, String>): BytecodeListing {
+        val data = cls.classNode?.clsData
+            ?: return BytecodeListing("Class: L${cls.rawName.replace('.', '/')};\n", IntArray(0), IntArray(0))
+        val out = LineWriter()
         out.appendLine("Class: ${data.type}")
         out.appendLine("AccessFlags: ${AccessFlags.format(data.accessFlags, AccessFlagsScope.CLASS).trim()}")
         out.appendLine("SuperType: ${data.superType}")
@@ -35,7 +40,7 @@ object BytecodeWriter {
         userAnnotations(data.attributes).forEach { out.appendLine(formatAnnotation(it)) }
 
         val fields = mutableListOf<FieldRow>()
-        val methods = StringBuilder()
+        val methods = LineWriter()
         data.visitFieldsAndMethods(
             ISeqConsumer<IFieldData> { field ->
                 fields.add(FieldRow(userAnnotations(field.attributes), "${modifiers(field.accessFlags, AccessFlagsScope.FIELD)}${field.name}", field.type))
@@ -53,12 +58,44 @@ object BytecodeWriter {
             }
         }
         out.append(methods)
-        return out.toString()
+        return BytecodeListing(out.toString(), out.offsetLines.toIntArray(), out.dexPcs.toIntArray())
     }
 
     private class FieldRow(val annotations: List<IAnnotation>, val declaration: String, val type: String)
 
-    private fun appendMethod(out: StringBuilder, method: IMethodData, resources: Map<Int, String>) {
+    private class LineWriter {
+        private val sb = StringBuilder()
+        var line = 0
+            private set
+        val offsetLines = ArrayList<Int>()
+        val dexPcs = ArrayList<Int>()
+
+        fun appendLine(text: String = "") {
+            sb.append(text).append('\n')
+            for (c in text) if (c == '\n') line++
+            line++
+        }
+
+        fun appendInsn(text: String, dexPc: Int) {
+            offsetLines.add(line)
+            dexPcs.add(dexPc)
+            appendLine(text)
+        }
+
+        fun append(other: LineWriter) {
+            val base = line
+            sb.append(other.sb)
+            for (i in other.offsetLines.indices) {
+                offsetLines.add(base + other.offsetLines[i])
+                dexPcs.add(other.dexPcs[i])
+            }
+            line += other.line
+        }
+
+        override fun toString() = sb.toString()
+    }
+
+    private fun appendMethod(out: LineWriter, method: IMethodData, resources: Map<Int, String>) {
         val ref = method.methodRef.apply { load() }
         out.appendLine()
         userAnnotations(method.attributes).forEach { out.appendLine(formatAnnotation(it)) }
@@ -109,21 +146,21 @@ object BytecodeWriter {
             if (insn.rawOpcodeUnit == 0x0100 || insn.rawOpcodeUnit == 0x0200 || insn.rawOpcodeUnit == 0x0300) {
                 appendPayload(out, insn, codeBase)
             } else {
-                out.appendLine("    ${formatInsn(insn, codeBase, resources, paramBase)}")
+                out.appendInsn("    ${formatInsn(insn, codeBase, resources, paramBase)}", insn.offset)
             }
             first = false
         }
         out.appendLine(".end method")
     }
 
-    private fun appendPayload(out: StringBuilder, insn: InsnData, codeBase: Int) {
+    private fun appendPayload(out: LineWriter, insn: InsnData, codeBase: Int) {
         val fileOffset = codeBase + insn.offset * 2
         val name = when (insn.rawOpcodeUnit) {
             0x0100 -> "packed-switch-payload"
             0x0200 -> "sparse-switch-payload"
             else -> "fill-array-data-payload"
         }
-        out.appendLine("    %08x: %-18s %04x: %s".format(fileOffset, "%04x".format(insn.rawOpcodeUnit), insn.offset, name))
+        out.appendInsn("    %08x: %-18s %04x: %s".format(fileOffset, "%04x".format(insn.rawOpcodeUnit), insn.offset, name), insn.offset)
         when (insn.rawOpcodeUnit) {
             0x0100, 0x0200 -> (insn.payload as? ISwitchPayload)?.let { sw ->
                 val keys = sw.keys; val targets = sw.targets
@@ -158,7 +195,7 @@ object BytecodeWriter {
         else -> value.toString()
     }
 
-    private fun appendTries(out: StringBuilder, reader: ICodeReader) {
+    private fun appendTries(out: LineWriter, reader: ICodeReader) {
         for (aTry in reader.tries) {
             val catch = aTry.catch
             val range = "%04x .. %04x".format(aTry.startOffset, aTry.endOffset)
@@ -317,7 +354,16 @@ object BytecodeWriter {
     }
 
     fun methodSmali(cls: JavaClass, shortId: String, resources: Map<Int, String>): String? =
-        withMethod(cls, shortId) { m -> StringBuilder().also { appendMethod(it, m, resources) }.toString().trim() }
+        withMethod(cls, shortId) { m -> LineWriter().also { appendMethod(it, m, resources) }.toString().trim() }
+
+    fun registerInfo(cls: JavaClass, shortId: String): IntArray? =
+        withMethod(cls, shortId) { m ->
+            val reader = m.codeReader ?: return@withMethod null
+            val ref = m.methodRef.apply { load() }
+            val isStatic = AccessFlags.hasFlag(m.accessFlags, AccessFlags.STATIC)
+            val insSize = (if (isStatic) 0 else 1) + ref.argTypes.sumOf { if (it == "J" || it == "D") 2 else 1 }
+            intArrayOf(reader.registersCount, reader.registersCount - insSize, if (isStatic) 1 else 0)
+        }
 
     fun instructions(cls: JavaClass, shortId: String, resources: Map<Int, String>): List<Map<String, Any?>>? =
         withMethod(cls, shortId) { m ->

@@ -24,6 +24,7 @@ class CodeTextArea(text: String, syntax: Syntax) : RSyntaxTextArea() {
             val factory = TokenMakerFactory.getDefaultInstance() as AbstractTokenMakerFactory
             factory.putMapping("text/smali", "io.github.nitanmarcel.jdex.syntax.BytecodeTokenMaker")
             factory.putMapping("text/jdex-asm", "io.github.nitanmarcel.jdex.syntax.AsmTokenMaker")
+            factory.putMapping("text/jdex-debug", "io.github.nitanmarcel.jdex.syntax.DebugTokenMaker")
         }
     }
 }

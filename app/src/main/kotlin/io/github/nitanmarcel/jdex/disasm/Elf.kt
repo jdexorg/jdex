@@ -3,14 +3,26 @@ package io.github.nitanmarcel.jdex.disasm
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-enum class ElfArch(val display: String) {
-    ARM("ARM"),
-    ARM64("AArch64"),
-    X86("x86"),
-    X86_64("x86-64"),
-    MIPS("MIPS"),
-    MIPS64("MIPS64"),
-    UNKNOWN("unknown"),
+enum class ElfArch(val display: String, val androidAbi: String? = null, val ndkLibDir: String? = null) {
+    ARM("ARM", "armeabi-v7a", "arm"),
+    ARM64("AArch64", "arm64-v8a", "aarch64"),
+    X86("x86", "x86", "i386"),
+    X86_64("x86-64", "x86_64", "x86_64"),
+    MIPS("MIPS", "mips"),
+    MIPS64("MIPS64", "mips64"),
+    UNKNOWN("unknown");
+
+    companion object {
+        fun fromAndroidAbi(abi: String): ElfArch? = when {
+            abi.startsWith("arm64") -> ARM64
+            abi.startsWith("armeabi") -> ARM
+            abi == "x86_64" -> X86_64
+            abi == "x86" -> X86
+            abi == "mips64" -> MIPS64
+            abi == "mips" -> MIPS
+            else -> null
+        }
+    }
 }
 
 class ElfSection(
@@ -26,7 +38,7 @@ class ElfSection(
     val hasBits get() = type != 8
 }
 
-class ElfSymbol(val name: String, val address: Long, val thumb: Boolean)
+class ElfSymbol(val name: String, val address: Long, val thumb: Boolean, val size: Long = 0)
 
 class ElfFile(
     val arch: ElfArch,
@@ -264,18 +276,21 @@ class ElfFile(
             }
         }
 
-        internal fun parseRelr(bytes: ByteArray, start: Int, size: Int, little: Boolean, emit: (Long) -> Unit) {
+        internal fun parseRelr(bytes: ByteArray, start: Int, size: Int, little: Boolean, is64: Boolean, emit: (Long) -> Unit) {
             val buf = ByteBuffer.wrap(bytes).order(if (little) ByteOrder.LITTLE_ENDIAN else ByteOrder.BIG_ENDIAN)
+            val w = if (is64) 8 else 4
+            val bitmapBits = if (is64) 63L else 31L
+            fun word(at: Int): Long = if (is64) buf.getLong(at) else buf.getInt(at).toLong() and 0xFFFFFFFFL
             var b = start; val end = start + size
             var where = 0L
-            while (b + 8 <= end && b + 8 <= bytes.size) {
-                val e = buf.getLong(b); b += 8
-                if (e and 1L == 0L) { where = e; emit(where); where += 8 }
+            while (b + w <= end && b + w <= bytes.size) {
+                val e = word(b); b += w
+                if (e and 1L == 0L) { where = e; emit(where); where += w }
                 else {
                     var bits = e ushr 1
                     var p = where
-                    while (bits != 0L) { if (bits and 1L != 0L) emit(p); bits = bits ushr 1; p += 8 }
-                    where += 63 * 8
+                    while (bits != 0L) { if (bits and 1L != 0L) emit(p); bits = bits ushr 1; p += w }
+                    where += bitmapBits * w
                 }
             }
         }
@@ -347,11 +362,11 @@ class ElfFile(
                 for (s in 0 until count) {
                     val b = (sec.offset + s.toLong() * entsize).toInt()
                     if (b + entsize > bytes.size) break
-                    val nameOff: Int; val value: Long; val info: Int
+                    val nameOff: Int; val value: Long; val info: Int; val size: Long
                     if (is64) {
-                        nameOff = u32(b); info = bytes[b + 4].toInt() and 0xFF; value = buf.getLong(b + 8)
+                        nameOff = u32(b); info = bytes[b + 4].toInt() and 0xFF; value = buf.getLong(b + 8); size = buf.getLong(b + 16)
                     } else {
-                        nameOff = u32(b); value = addr(b + 4); info = bytes[b + 12].toInt() and 0xFF
+                        nameOff = u32(b); value = addr(b + 4); info = bytes[b + 12].toInt() and 0xFF; size = u32(b + 8).toLong() and 0xFFFFFFFFL
                     }
                     if (wantsMapping && (info and 0xF) == 0 && value != 0L) {
                         val nm = stringAt(str.offset, str.size, nameOff)
@@ -368,7 +383,7 @@ class ElfFile(
                     val address = if (thumb) value and 1L.inv() else value
                     if (arch == ElfArch.ARM) mapping.add(address to if (thumb) MAP_THUMB else MAP_ARM)
                     if (nm.isEmpty() || !seen.add(address)) continue
-                    functions.add(ElfSymbol(nm, address, thumb))
+                    functions.add(ElfSymbol(nm, address, thumb, size))
                 }
             }
             functions.sortBy { it.address }
@@ -431,15 +446,17 @@ class ElfFile(
                     if (nm.isNotEmpty()) relocs[rOffset] = nm
                 }
             }
-            if (is64 && ro.isNotEmpty()) {
+            val ptrStride = if (is64) 8 else 4
+            if (ro.isNotEmpty()) {
                 fun roSlotValue(vaddr: Long): Long? {
                     val sec = ro.firstOrNull { vaddr >= it.addr && vaddr < it.addr + it.size } ?: return null
                     val fo = (sec.offset + (vaddr - sec.addr)).toInt()
-                    return if (fo < 0 || fo + 8 > bytes.size) null else buf.getLong(fo)
+                    if (fo < 0 || fo + ptrStride > bytes.size) return null
+                    return if (is64) buf.getLong(fo) else buf.getInt(fo).toLong() and 0xFFFFFFFFL
                 }
                 for (sec in raws) {
                     if (sec.type != SHT_RELR) continue
-                    parseRelr(bytes, sec.offset.toInt(), sec.size.toInt(), little) { vaddr ->
+                    parseRelr(bytes, sec.offset.toInt(), sec.size.toInt(), little, is64) { vaddr ->
                         roSlotValue(vaddr)?.let { v ->
                             if (v != 0L) relocPtrs[vaddr] = v
                             if (inExec(v)) vtSlots.add(vaddr)
@@ -452,8 +469,8 @@ class ElfFile(
                 vtSlots.sort()
                 var run = 1
                 for (i in 1 until vtSlots.size) {
-                    if (vtSlots[i] == vtSlots[i - 1] + 8) run++ else run = 1
-                    if ((run - 1) * 8L > maxVtableOffset) maxVtableOffset = (run - 1) * 8L
+                    if (vtSlots[i] == vtSlots[i - 1] + ptrStride) run++ else run = 1
+                    if ((run - 1) * ptrStride.toLong() > maxVtableOffset) maxVtableOffset = (run - 1) * ptrStride.toLong()
                 }
             }
 

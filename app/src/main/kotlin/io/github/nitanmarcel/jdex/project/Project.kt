@@ -5,7 +5,7 @@ import java.security.MessageDigest
 import java.sql.Connection
 import java.sql.DriverManager
 
-class Project private constructor(file: File?, connection: Connection) : AutoCloseable, CommentStore, BookmarkStore, RenameStore, DexStore, FileStore {
+class Project private constructor(file: File?, connection: Connection) : AutoCloseable, CommentStore, BookmarkStore, RenameStore, DexStore, FileStore, BreakpointStore {
 
     var file: File? = file
         private set
@@ -72,6 +72,34 @@ class Project private constructor(file: File?, connection: Connection) : AutoClo
     override fun removeFile(path: String) {
         connection.prepareStatement("DELETE FROM imported_file WHERE path = ?").use {
             it.setString(1, path)
+            it.executeUpdate()
+        }
+        markDirty()
+    }
+
+    override fun breakpoints(): List<StoredBreakpoint> {
+        val list = ArrayList<StoredBreakpoint>()
+        connection.createStatement().use { st ->
+            st.executeQuery("SELECT descriptor, dex_pc FROM breakpoint").use { rs ->
+                while (rs.next()) list.add(StoredBreakpoint(rs.getString(1), rs.getInt(2)))
+            }
+        }
+        return list
+    }
+
+    override fun addBreakpoint(descriptor: String, dexPc: Int) {
+        connection.prepareStatement("INSERT OR REPLACE INTO breakpoint(descriptor, dex_pc) VALUES(?, ?)").use {
+            it.setString(1, descriptor)
+            it.setInt(2, dexPc)
+            it.executeUpdate()
+        }
+        markDirty()
+    }
+
+    override fun removeBreakpoint(descriptor: String, dexPc: Int) {
+        connection.prepareStatement("DELETE FROM breakpoint WHERE descriptor = ? AND dex_pc = ?").use {
+            it.setString(1, descriptor)
+            it.setInt(2, dexPc)
             it.executeUpdate()
         }
         markDirty()
@@ -262,6 +290,10 @@ class Project private constructor(file: File?, connection: Connection) : AutoClo
                 if (version < 7) {
                     statement.executeUpdate("CREATE TABLE imported_file(path TEXT PRIMARY KEY, bytes BLOB NOT NULL)")
                     statement.executeUpdate("PRAGMA user_version = 7")
+                }
+                if (version < 8) {
+                    statement.executeUpdate("CREATE TABLE breakpoint(descriptor TEXT NOT NULL, dex_pc INTEGER NOT NULL, PRIMARY KEY(descriptor, dex_pc))")
+                    statement.executeUpdate("PRAGMA user_version = 8")
                 }
             }
         }

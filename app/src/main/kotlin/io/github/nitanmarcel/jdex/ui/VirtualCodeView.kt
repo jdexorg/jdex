@@ -42,6 +42,11 @@ import javax.swing.ListSelectionModel
 import javax.swing.SwingUtilities
 import javax.swing.text.Segment
 
+private val asmOffsetRe = Regex("^([0-9a-f]{8}):")
+
+fun parseAsmVaddr(line: String): Long? =
+    asmOffsetRe.find(line)?.groupValues?.get(1)?.toLongOrNull(16)
+
 private data class Pos(val line: Int, val col: Int) : Comparable<Pos> {
     override fun compareTo(other: Pos) = compareValuesBy(this, other, Pos::line, Pos::col)
 }
@@ -121,6 +126,28 @@ class VirtualCodeView(
     private var syncHighlightLine: Int? = null
     var syncApprox = false
 
+    private var debugLine: Int? = null
+    private var debugInline: Map<String, String>? = null
+    private var debugPopupText: String? = null
+    private var debugPopup: javax.swing.Popup? = null
+    private val regTokenPattern = if (isAsm)
+        Regex("\\b(?:[xyz]mm\\d+|[xwvqsd]\\d+|r\\d+[bwd]?|\\\$\\w+|sp|pc|fp|lr|cpsr|xzr|wzr|[er]?[abcd]x|[abcd][lh]|[er]?(?:si|di|bp|sp)|sil|dil|bpl|spl|rip|eip)\\b")
+    else Regex("\\b[vp]\\d+\\b")
+    private val breakpointLines = HashSet<Int>()
+    private var debugLineColor = Color(0x53, 0x9B, 0xF5, 96)
+    private var debugArrowColor = Color(0xF2, 0xC2, 0x4B)
+    private var breakpointColor = Color(0xE5, 0x1C, 0x23)
+    var onToggleBreakpoint: ((descriptor: String, dexPc: Int, added: Boolean) -> Unit)? = null
+    var onRunToCursor: ((descriptor: String, dexPc: Int) -> Unit)? = null
+    var onToggleNativeBreakpoint: ((vaddr: Long, added: Boolean) -> Unit)? = null
+    var onRunToCursorNative: ((vaddr: Long) -> Unit)? = null
+    var onViewMemoryNative: ((operand: String) -> Unit)? = null
+    var onPatchNative: ((vaddr: Long) -> Unit)? = null
+    var nativePatchEnabled: () -> Boolean = { false }
+    var onEnableNative: (() -> Unit)? = null
+    var nativeEnableVisible: () -> Boolean = { false }
+    private val nativeBreakpoints = HashSet<Long>()
+
     private var topLine = 0
     private var xOffset = 0
     private var maxWidth = 0
@@ -157,6 +184,9 @@ class VirtualCodeView(
         highlightColor = UiColors.alpha(accent, 96)
         syncColor = UiColors.alpha(accent, 56)
         bookmarkColor = UiColors.info()
+        breakpointColor = UiColors.error()
+        debugArrowColor = UiColors.warning()
+        debugLineColor = UiColors.alpha(UiColors.success(), 64)
         surface.background = background
         surface.foreground = foreground
         gutter.background = background
@@ -475,6 +505,10 @@ class VirtualCodeView(
                     g.color = syncColor
                     g.fillRect(0, y, width, lineHeight)
                 }
+                if (index == debugLine) {
+                    g.color = debugLineColor
+                    g.fillRect(0, y, width, lineHeight)
+                }
                 if (index == caret.line) {
                     g.color = currentLineColor
                     g.fillRect(0, y, width, lineHeight)
@@ -504,6 +538,17 @@ class VirtualCodeView(
                     commentCache[anchor]?.let { c ->
                         g.color = commentColor
                         g.drawString("    ; $c", line.length * charWidth - xOffset, y + ascent)
+                    }
+                }
+                debugInline?.takeIf { index == debugLine }?.let { values ->
+                    val parts = regTokenPattern.findAll(line).map { it.value }.distinct()
+                        .mapNotNull { r -> values[r]?.let { "$r=$it" } }.toList()
+                    if (parts.isNotEmpty()) {
+                        val text = "◄ " + parts.joinToString("   ")
+                        g.color = UiColors.accent()
+                        val tw = g.fontMetrics.stringWidth(text)
+                        val x = (width - tw - 8).coerceAtLeast(line.length * charWidth - xOffset + 6 * charWidth)
+                        g.drawString(text, x, y + ascent)
                     }
                 }
                 grew = maxOf(grew, line.length * charWidth)
@@ -553,7 +598,9 @@ class VirtualCodeView(
                     val idx = arrowAt(e.x, e.y)
                     if (idx >= 0) { goToLine(arrowList[idx][1]); return }
                     val line = topLine + e.y / lineHeight
-                    if (line in 0 until source.lineCount) gotoBranchFrom(line)
+                    if (line !in 0 until source.lineCount) return
+                    if (e.x <= digitsW && toggleBreakpoint(line)) return
+                    gotoBranchFrom(line)
                 }
 
                 override fun mouseMoved(e: MouseEvent) {
@@ -605,9 +652,18 @@ class VirtualCodeView(
             for (k in 0 until visible) {
                 val index = topLine + k
                 if (index >= source.lineCount) break
-                if (index in bookmarkLines) {
+                val asmBp = isAsm && parseAsmVaddr(rawLineText(index).trimStart()) in nativeBreakpoints
+                if (index in breakpointLines || asmBp) {
+                    g.color = breakpointColor
+                    g.fillOval(2, k * lineHeight + (lineHeight - 8) / 2, 8, 8)
+                } else if (index in bookmarkLines) {
                     g.color = bookmarkColor
                     g.fillOval(2, k * lineHeight + (lineHeight - 6) / 2, 6, 6)
+                }
+                if (index == debugLine) {
+                    val top = k * lineHeight + lineHeight / 2 - 5
+                    g.color = debugArrowColor
+                    (g as Graphics2D).fillPolygon(intArrayOf(1, 8, 1), intArrayOf(top, top + 5, top + 10), 3)
                 }
                 g.color = if (index == caret.line) foreground else gutterColor
                 val label = (index + 1).toString()
@@ -806,6 +862,40 @@ class VirtualCodeView(
         gutter.repaint()
     }
 
+    private fun toggleBreakpointAtCaret() { toggleBreakpoint(caret.line) }
+
+    private fun memOperandAtCaret(): String? {
+        if (!isAsm) return null
+        val line = rawLineText(caret.line)
+        Regex("(?:(fs|gs|ds|es|cs|ss):)?\\[([^\\]]+)\\]", RegexOption.IGNORE_CASE).find(line)?.let { m ->
+            val seg = m.groupValues[1]
+            val inner = m.groupValues[2].trim()
+            return if (seg.isNotEmpty()) "$seg:$inner" else inner
+        }
+        Regex("(-?(?:0x)?[0-9a-fA-F]*)\\((\\\$\\w+)\\)").find(line)?.let { m ->
+            val disp = m.groupValues[1]
+            val reg = m.groupValues[2]
+            if (disp.isEmpty()) return reg
+            return if (disp.startsWith("-")) "$reg - ${disp.drop(1)}" else "$reg + $disp"
+        }
+        return null
+    }
+
+    private fun runToCursorAtCaret() {
+        if (isAsm) { parseAsmVaddr(rawLineText(caret.line).trimStart())?.let { onRunToCursorNative?.invoke(it) }; return }
+        val descriptor = methodKeyAt(caret.line) ?: return
+        val dexPc = source.dexPcAt(caret.line) ?: return
+        onRunToCursor?.invoke(descriptor, dexPc)
+    }
+
+    private fun patchAtCaret() {
+        if (isAsm) parseAsmVaddr(rawLineText(caret.line).trimStart())?.let { onPatchNative?.invoke(it) }
+    }
+
+    private fun breakpointableAt(line: Int): Boolean =
+        if (isAsm) parseAsmVaddr(rawLineText(line).trimStart()) != null
+        else methodKeyAt(line) != null && source.dexPcAt(line) != null
+
     private fun showBookmarks() {
         val lines = bookmarkLines.sorted()
         if (lines.isEmpty()) {
@@ -818,6 +908,40 @@ class VirtualCodeView(
         list.addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
                 if (e.clickCount == 2 && list.selectedIndex >= 0) { goToLine(lines[list.selectedIndex]); dialog.dispose() }
+            }
+        })
+        dialog.isVisible = true
+    }
+
+    private fun showBreakpoints() {
+        val lines = breakpointLines.sorted().toMutableList()
+        if (lines.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "No breakpoints", "Breakpoints", JOptionPane.INFORMATION_MESSAGE)
+            return
+        }
+        val model = javax.swing.DefaultListModel<String>()
+        lines.forEach { model.addElement("${it + 1}:  ${source.lines(it, 1).firstOrNull()?.trim() ?: ""}") }
+        val list = JList(model).apply { selectionMode = ListSelectionModel.SINGLE_SELECTION; font = codeFont }
+        val dialog = JOptionPane(JScrollPane(list).apply { preferredSize = Dimension(720, 320) }, JOptionPane.PLAIN_MESSAGE)
+            .createDialog(this, "Breakpoints  (Enter/double-click: go to · Delete: remove)")
+        list.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                if (e.clickCount == 2 && list.selectedIndex >= 0) { goToLine(lines[list.selectedIndex]); dialog.dispose() }
+            }
+        })
+        list.addKeyListener(object : java.awt.event.KeyAdapter() {
+            override fun keyPressed(e: KeyEvent) {
+                val idx = list.selectedIndex
+                if (idx < 0) return
+                when (e.keyCode) {
+                    KeyEvent.VK_ENTER -> { goToLine(lines[idx]); dialog.dispose() }
+                    KeyEvent.VK_DELETE -> {
+                        toggleBreakpoint(lines[idx])
+                        lines.removeAt(idx); model.remove(idx)
+                        gutter.repaint()
+                        if (model.isEmpty) dialog.dispose() else list.selectedIndex = idx.coerceAtMost(model.size() - 1)
+                    }
+                }
             }
         })
         dialog.isVisible = true
@@ -943,6 +1067,9 @@ class VirtualCodeView(
         ViewAction("Back") { back() },
         ViewAction("Forward") { forward() },
         ViewAction("Add / Edit Comment") { addComment() },
+        ViewAction("Toggle Breakpoint") { toggleBreakpointAtCaret() },
+        ViewAction("Run to Cursor") { runToCursorAtCaret() },
+        ViewAction("Show Breakpoints…") { showBreakpoints() },
         ViewAction("Toggle Bookmark") { toggleBookmark() },
         ViewAction("Show Bookmarks…") { showBookmarks() },
         ViewAction("Decompile to Java") { decompile() },
@@ -1065,12 +1192,14 @@ class VirtualCodeView(
                 val line = topLine + e.y / lineHeight
                 val h = if (line in 0 until source.lineCount) line else -1
                 if (h != hoverLine) { hoverLine = h; surface.repaint() }
+                if (h == debugLine && debugPopupText != null) { if (debugPopup == null) showDebugPopup(e) } else hideDebugPopup()
                 val branch = h >= 0 && (branchTarget(rawLineText(h))?.get(1) ?: -1) >= 0
                 surface.cursor = java.awt.Cursor.getPredefinedCursor(if (branch) java.awt.Cursor.HAND_CURSOR else java.awt.Cursor.TEXT_CURSOR)
             }
 
             override fun mouseExited(e: MouseEvent) {
                 if (hoverLine != -1) { hoverLine = -1; surface.repaint() }
+                hideDebugPopup()
             }
 
             override fun mouseDragged(e: MouseEvent) {
@@ -1109,7 +1238,10 @@ class VirtualCodeView(
             bind(KeyEvent.VK_UP, shortcut, "prevMethod") { gotoMethod(false) }
             bind('C'.code, shortcut or KeyEvent.SHIFT_DOWN_MASK, "copyMethod") { copyMethod() }
             bind(KeyEvent.VK_N, 0, "rename") { renameSymbol() }
+            bind(KeyEvent.VK_F9, KeyEvent.SHIFT_DOWN_MASK, "showBreakpoints") { showBreakpoints() }
         }
+        bind(KeyEvent.VK_F9, 0, "breakpoint") { toggleBreakpointAtCaret() }
+        bind(KeyEvent.VK_F4, 0, "runToCursor") { runToCursorAtCaret() }
         if (isAsm) bind(KeyEvent.VK_TAB, 0, "pseudo") { showPseudo() }
         if (isAsm && nativeId != null) bind(KeyEvent.VK_N, 0, "rename") { renameSymbol() }
         if (isAsm) {
@@ -1170,12 +1302,18 @@ class VirtualCodeView(
             add(menuItem("Go to Address…", 'G'.code, shortcut) { goToAddress() })
             if (!isAsm) add(menuItem("Go to Main Activity") { goToMainActivity() })
             addSeparator()
+            add(menuItem("Toggle Breakpoint", KeyEvent.VK_F9, 0, enabled = breakpointableAt(caret.line)) { toggleBreakpointAtCaret() })
+            add(menuItem("Run to Cursor", KeyEvent.VK_F4, 0, enabled = breakpointableAt(caret.line)) { runToCursorAtCaret() })
+            if (!isAsm) add(menuItem("Show Breakpoints…", KeyEvent.VK_F9, KeyEvent.SHIFT_DOWN_MASK) { showBreakpoints() })
             add(menuItem("Toggle Bookmark", 'B'.code, shortcut) { toggleBookmark() })
             add(menuItem("Show Bookmarks…") { showBookmarks() })
             if (isAsm) {
                 add(menuItem("Go to Symbol…", 'L'.code, shortcut) { gotoSymbol() })
                 add(menuItem("Segments…", 'L'.code, shortcut or KeyEvent.SHIFT_DOWN_MASK) { showSegments() })
                 add(menuItem("Strings…", 'S'.code, shortcut or KeyEvent.SHIFT_DOWN_MASK) { showStrings() })
+                add(menuItem("View Operand in Memory", enabled = memOperandAtCaret() != null) { memOperandAtCaret()?.let { onViewMemoryNative?.invoke(it) } })
+                if (nativeEnableVisible()) add(menuItem("Enable native debugging") { onEnableNative?.invoke() })
+                add(menuItem("Patch (assemble)…", enabled = breakpointableAt(caret.line) && nativePatchEnabled()) { patchAtCaret() })
                 if (nativeInfo != null) {
                     add(menuItem("Exports…") { showExports() })
                     add(menuItem("Imports…") { showImports() })
@@ -1278,9 +1416,8 @@ class VirtualCodeView(
         fun isRet(raw: String): Boolean {
             val t = raw.trimStart()
             if (t.length < 10 || t[8] != ':') return false
-            val rest = t.substring(9).trim()
-            val mnem = rest.substringAfter(' ').trim().substringBefore(' ')
-            return mnem == "ret" || mnem == "retaa" || mnem == "retab" || mnem == "eret"
+            val mo = t.substring(9).trim().substringAfter(' ').trim()
+            return io.github.nitanmarcel.jdex.disasm.Mnemonics.isReturn(mo.substringBefore(' '), mo.substringAfter(' ', ""))
         }
         var start = 0
         var afterRet = -1
@@ -1345,7 +1482,7 @@ class VirtualCodeView(
 
     private fun calleeArgCount(target: String): Int? = calleeArgCache.getOrPut(target) {
         val ls = source.sectionStart(target) ?: return@getOrPut null
-        io.github.nitanmarcel.jdex.disasm.NativePseudo.argCount(source.lines(ls, 64))
+        io.github.nitanmarcel.jdex.disasm.NativePseudo.argCount(source.lines(ls, 64), x86Is32)
     }
 
     private fun showGraph() {
@@ -1403,6 +1540,14 @@ class VirtualCodeView(
         background {
             val line = source.search(token, 0, true, false)
             SwingUtilities.invokeLater { if (line != null) goToLine(line) }
+        }
+    }
+
+    fun revealNativeLocation(vaddr: Long) {
+        val token = "%08x:".format(vaddr)
+        background {
+            val line = source.search(token, 0, true, false)
+            SwingUtilities.invokeLater { if (line != null) { debugLine = line; goToLine(line); gutter.repaint() } }
         }
     }
 
@@ -1619,6 +1764,124 @@ class VirtualCodeView(
             val target = found ?: start
             SwingUtilities.invokeLater { goToLine(target) }
         }
+    }
+
+    fun revealDexLocation(fullName: String, shortId: String, dexPc: Int) {
+        val start = source.sectionStart(fullName) ?: return
+        background {
+            var line = start + 1
+            var inMethod = false
+            var found: Int? = null
+            while (line < source.lineCount && found == null) {
+                val text = source.lines(line, 1).firstOrNull() ?: break
+                if (text.startsWith("Class:")) break
+                val t = text.trimStart()
+                if (t.startsWith(".method")) inMethod = text.contains(shortId)
+                else if (inMethod && source.dexPcAt(line) == dexPc) found = line
+                line++
+            }
+            val target = found
+            SwingUtilities.invokeLater {
+                if (target != null) { debugLine = target; goToLine(target); gutter.repaint() }
+                else revealMethod(fullName, shortId)
+            }
+        }
+    }
+
+    fun clearDebugLine() {
+        debugLine = null
+        debugInline = null
+        debugPopupText = null
+        hideDebugPopup()
+        surface.repaint()
+        gutter.repaint()
+    }
+
+    fun setDebugInlineValues(values: Map<String, String>?) {
+        debugInline = values
+        surface.repaint()
+    }
+
+    fun setDebugPopup(text: String?) {
+        debugPopupText = text
+        if (text == null) hideDebugPopup()
+    }
+
+    private fun showDebugPopup(e: MouseEvent) {
+        val text = debugPopupText ?: return
+        val area = org.fife.ui.rsyntaxtextarea.RSyntaxTextArea().apply {
+            isEditable = false
+            antiAliasingEnabled = true
+            highlightCurrentLine = false
+            font = codeFont
+            syntaxEditingStyle = "text/jdex-debug"
+            this.text = text
+            caretPosition = 0
+            SyntaxThemes.attach(this)
+        }
+        val panel = JPanel(BorderLayout()).apply {
+            border = javax.swing.BorderFactory.createLineBorder(UiColors.border())
+            add(area, BorderLayout.CENTER)
+        }
+        debugPopup = javax.swing.PopupFactory.getSharedInstance().getPopup(surface, panel, e.xOnScreen + 12, e.yOnScreen + 16)
+        debugPopup?.show()
+    }
+
+    private fun hideDebugPopup() {
+        debugPopup?.hide()
+        debugPopup = null
+    }
+
+    fun setBreakpointLines(lines: Collection<Int>) {
+        breakpointLines.clear()
+        breakpointLines.addAll(lines)
+        gutter.repaint()
+    }
+
+    fun markNativeBreakpoints(vaddrs: Collection<Long>) {
+        nativeBreakpoints.clear(); nativeBreakpoints.addAll(vaddrs); repaint()
+    }
+
+    fun nativeBreakpointSet(): Set<Long> = nativeBreakpoints.toSet()
+
+    fun markBreakpoints(locations: Collection<Pair<String, Int>>) {
+        if (locations.isEmpty()) { setBreakpointLines(emptyList()); return }
+        background {
+            val lines = HashSet<Int>()
+            for ((descriptor, dexPc) in locations) {
+                val fullName = descriptor.substringBefore("->").removePrefix("L").removeSuffix(";").replace('/', '.')
+                val shortId = descriptor.substringAfter("->")
+                val start = source.sectionStart(fullName) ?: continue
+                var line = start + 1
+                var inMethod = false
+                while (line < source.lineCount) {
+                    val text = source.lines(line, 1).firstOrNull() ?: break
+                    if (text.startsWith("Class:")) break
+                    val t = text.trimStart()
+                    if (t.startsWith(".method")) { if (inMethod) break; inMethod = text.contains(shortId) }
+                    else if (inMethod && source.dexPcAt(line) == dexPc) { lines.add(line); break }
+                    line++
+                }
+            }
+            SwingUtilities.invokeLater { setBreakpointLines(lines) }
+        }
+    }
+
+    private fun toggleBreakpoint(line: Int): Boolean {
+        if (isAsm) {
+            val vaddr = parseAsmVaddr(rawLineText(line).trimStart()) ?: return false
+            val added = nativeBreakpoints.add(vaddr).also { if (!it) nativeBreakpoints.remove(vaddr) }
+            onToggleNativeBreakpoint?.invoke(vaddr, added)
+            repaint()
+            return true
+        }
+        val descriptor = methodKeyAt(line) ?: return false
+        val dexPc = source.dexPcAt(line) ?: return false
+        val added = breakpointLines.add(line)
+        if (!added) breakpointLines.remove(line)
+        gutter.repaint()
+        onToggleBreakpoint?.invoke(descriptor, dexPc, added)
+        return true
     }
 
     fun revealField(fullName: String, name: String) {

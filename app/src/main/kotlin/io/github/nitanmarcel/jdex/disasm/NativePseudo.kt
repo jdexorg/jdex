@@ -26,7 +26,7 @@ object NativePseudo {
         return t.endsWith(":") && t.length > 1 && (t[0].isLetter() || t[0] == '_') && !t.startsWith("loc_") && ' ' !in t
     }
 
-    fun argCount(lines: List<String>): Int {
+    fun argCount(lines: List<String>, x86Is32: Boolean? = null): Int {
         var start = 0
         while (start < lines.size && !isFuncLabel(lines[start])) start++
         if (start >= lines.size) start = 0
@@ -34,7 +34,7 @@ object NativePseudo {
         for (i in start + 1 until lines.size) if (isFuncLabel(lines[i])) { end = i; break }
         val fn = lines.subList(start, end)
         val insns = parse(fn)
-        return detectArgs(argSpec(detectArch(fn), insns), insns).size
+        return detectArgs(argSpec(detectArch(fn), insns, x86Is32), insns).size
     }
 
     class PseudoCode(val text: String, val lineAddrs: LongArray)
@@ -346,7 +346,8 @@ object NativePseudo {
         return when (arch) {
             A.ARM -> if (Regex("""\b[xw]\d""").containsMatchIn(sample)) (0..7).map { Regex("""\b[xw]$it\b""") to "x$it" }
             else (0..3).map { Regex("""\br$it\b""") to "r$it" }
-            A.X86 -> if (x86Is32 ?: isX86_32(sample)) emptyList()
+            A.X86 -> if (x86Is32 ?: isX86_32(sample))
+                (0..7).map { k -> val d = 8 + k * 4; Regex("""\[ebp\s*\+\s*(?:$d|0x${d.toString(16)})\]""") to "arg$k" }
             else listOf(
                 Regex("""\b(rdi|edi|dil)\b""") to "rdi",
                 Regex("""\b(rsi|esi|sil)\b""") to "rsi",

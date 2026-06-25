@@ -1,5 +1,6 @@
 [versions]
 apksig = "8.13.2"
+ddmlib = "31.13.2"
 jna = "5.14.0"
 binarydata = "0.2.2"
 bined = "0.2.2"
@@ -7,6 +8,7 @@ coroutines = "1.11.0"
 flatlaf = "3.7.1"
 graalpy = "25.0.2"
 jadx = "1.5.5"
+jdwp = "2.0.0"
 jungrapht = "1.4"
 junit-jupiter = "6.0.1"
 kotlin = "2.3.20"
@@ -18,6 +20,7 @@ sqlite = "3.53.2.0"
 
 [libraries]
 apksig = { module = "com.android.tools.build:apksig", version.ref = "apksig" }
+ddmlib = { module = "com.android.tools.ddms:ddmlib", version.ref = "ddmlib" }
 jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
 bined-swing = { module = "org.exbin.bined:bined-swing", version.ref = "bined" }
 binary-data = { module = "org.exbin.auxiliary:binary_data", version.ref = "binarydata" }
@@ -32,6 +35,7 @@ graalpy-truffle-runtime = { module = "org.graalvm.truffle:truffle-runtime", vers
 graalpy-regex = { module = "org.graalvm.regex:regex", version.ref = "graalpy" }
 jadx-core = { module = "io.github.skylot:jadx-core", version.ref = "jadx" }
 jadx-dex-input = { module = "io.github.skylot:jadx-dex-input", version.ref = "jadx" }
+jdwp = { module = "io.github.skylot:jdwp", version.ref = "jdwp" }
 jungrapht-layout = { module = "com.github.tomnelson:jungrapht-layout", version.ref = "jungrapht" }
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit-jupiter" }
 kotlinx-coroutines-swing = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-swing", version.ref = "coroutines" }

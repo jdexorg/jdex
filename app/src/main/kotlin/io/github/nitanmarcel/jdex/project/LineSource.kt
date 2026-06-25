@@ -7,13 +7,20 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStreamReader
 
-class LabeledChunk(val label: String, val text: String)
+class LabeledChunk(
+    val label: String,
+    val text: String,
+    val offsetLines: IntArray = IntArray(0),
+    val dexPcs: IntArray = IntArray(0),
+)
 
 class GenerationCancelled : RuntimeException()
 
 interface LineSource : AutoCloseable {
     val lineCount: Int
     fun lines(from: Int, count: Int): List<String>
+
+    fun dexPcAt(line: Int): Int? = null
 
     fun sectionAt(line: Int): String?
 
@@ -36,7 +43,25 @@ class DiskLineSource private constructor(
     private val stride: Int,
     private val sectionLines: IntArray,
     private val sectionNames: Array<String>,
+    private val dexPcLines: IntArray,
+    private val dexPcValues: IntArray,
 ) : LineSource {
+
+    override fun dexPcAt(line: Int): Int? {
+        if (dexPcLines.isEmpty()) return null
+        var lo = 0
+        var hi = dexPcLines.size - 1
+        while (lo <= hi) {
+            val mid = (lo + hi) ushr 1
+            val v = dexPcLines[mid]
+            when {
+                v < line -> lo = mid + 1
+                v > line -> hi = mid - 1
+                else -> return dexPcValues[mid]
+            }
+        }
+        return null
+    }
 
     private val lock = Any()
     private val chunkCache = object : LinkedHashMap<Int, List<String>>(MAX_CHUNKS * 2, 0.75f, true) {
@@ -156,13 +181,20 @@ class DiskLineSource private constructor(
             val offsets = ArrayList<Long>().apply { add(0L) }
             val sectionLines = ArrayList<Int>()
             val sectionNames = ArrayList<String>()
+            val dexPcLines = ArrayList<Int>()
+            val dexPcValues = ArrayList<Int>()
             var lineCount = 0
             var bytePos = 0L
             try {
                 BufferedOutputStream(FileOutputStream(file)).use { out ->
                     for (chunk in chunks) {
+                        val chunkStart = lineCount
                         sectionLines.add(lineCount)
                         sectionNames.add(chunk.label)
+                        for (k in chunk.offsetLines.indices) {
+                            dexPcLines.add(chunkStart + chunk.offsetLines[k])
+                            dexPcValues.add(chunk.dexPcs[k])
+                        }
                         val bytes = chunk.text.toByteArray(Charsets.UTF_8)
                         out.write(bytes)
                         for (i in bytes.indices) {
@@ -178,7 +210,7 @@ class DiskLineSource private constructor(
                 file.delete()
                 throw e
             }
-            return DiskLineSource(file, offsets.toLongArray(), lineCount, stride, sectionLines.toIntArray(), sectionNames.toTypedArray())
+            return DiskLineSource(file, offsets.toLongArray(), lineCount, stride, sectionLines.toIntArray(), sectionNames.toTypedArray(), dexPcLines.toIntArray(), dexPcValues.toIntArray())
         }
     }
 }

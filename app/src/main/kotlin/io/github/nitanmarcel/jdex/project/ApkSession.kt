@@ -296,6 +296,10 @@ class ApkSession private constructor(
     fun methodInfo(rawName: String, shortId: String): Map<String, Any?>? =
         classNode(rawName)?.let { BytecodeWriter.methodInfo(it, shortId) }
 
+    fun registerMeta(rawName: String, shortId: String): io.github.nitanmarcel.jdex.debug.RegisterMeta? =
+        classNode(rawName)?.let { BytecodeWriter.registerInfo(it, shortId) }
+            ?.let { io.github.nitanmarcel.jdex.debug.RegisterMeta(it[0], it[1], it[2] == 1) }
+
     fun fieldInfo(rawName: String, name: String): Map<String, Any?>? =
         classNode(rawName)?.let { BytecodeWriter.fieldInfo(it, name) }
 
@@ -533,9 +537,9 @@ class ApkSession private constructor(
             val chunks = classes.asSequence().mapIndexed { index, cls ->
                 if (cancel()) throw GenerationCancelled()
                 progress(index + 1, total)
-                val text = runCatching { BytecodeWriter.forClass(cls, resources) }
-                    .getOrElse { "# failed to disassemble ${cls.rawName}: ${it.message}\n" } + "\n"
-                LabeledChunk(cls.rawName, text)
+                val listing = runCatching { BytecodeWriter.forClassListing(cls, resources) }
+                    .getOrElse { BytecodeWriter.BytecodeListing("# failed to disassemble ${cls.rawName}: ${it.message}\n", IntArray(0), IntArray(0)) }
+                LabeledChunk(cls.rawName, listing.text + "\n", listing.offsetLines, listing.dexPcs)
             }
             return try {
                 DiskLineSource.build(chunks)
@@ -557,15 +561,7 @@ class ApkSession private constructor(
             else BinaryContent(bytes)
         }
 
-        fun abiFolder(arch: io.github.nitanmarcel.jdex.disasm.ElfArch): String? = when (arch) {
-            io.github.nitanmarcel.jdex.disasm.ElfArch.ARM64 -> "arm64-v8a"
-            io.github.nitanmarcel.jdex.disasm.ElfArch.ARM -> "armeabi-v7a"
-            io.github.nitanmarcel.jdex.disasm.ElfArch.X86 -> "x86"
-            io.github.nitanmarcel.jdex.disasm.ElfArch.X86_64 -> "x86_64"
-            io.github.nitanmarcel.jdex.disasm.ElfArch.MIPS -> "mips"
-            io.github.nitanmarcel.jdex.disasm.ElfArch.MIPS64 -> "mips64"
-            io.github.nitanmarcel.jdex.disasm.ElfArch.UNKNOWN -> null
-        }
+        fun abiFolder(arch: io.github.nitanmarcel.jdex.disasm.ElfArch): String? = arch.androidAbi
 
         private fun readEntryFull(input: File, name: String): ByteArray = runCatching {
             ZipFile(input).use { zip ->

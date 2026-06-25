@@ -250,12 +250,106 @@ class _Ui:
         self._host.uiOpen(node.descriptor if isinstance(node, _Node) else str(node))
 
 
+class _Debug:
+    """Debugger control: attach to a debuggable process, set breakpoints, step, inspect frames/locals."""
+
+    def __init__(self, host):
+        self._host = host
+
+    def devices(self):
+        """Connected devices/emulators as a list of {serial, label, online}."""
+        return [_as_dict(d) for d in self._host.debugDevices()]
+
+    def processes(self, serial):
+        """Running app processes on a device as a list of {pid, name}."""
+        return [_as_dict(p) for p in self._host.debugProcesses(str(serial))]
+
+    def attach(self, serial, pid):
+        """Attach the debugger to process `pid` on device `serial`. Returns True on success."""
+        return self._host.debugAttach(str(serial), int(pid))
+
+    def detach(self):
+        """Detach the debugger and let the process run freely."""
+        self._host.debugDetach()
+
+    def resume(self):
+        """Resume execution after a stop."""
+        self._host.debugResume()
+
+    def pause(self):
+        """Suspend the process at its current point."""
+        self._host.debugPause()
+
+    def step_into(self):
+        """Step into the next call."""
+        self._host.debugStepInto()
+
+    def step_over(self):
+        """Step over the next line."""
+        self._host.debugStepOver()
+
+    def step_out(self):
+        """Step out of the current method."""
+        self._host.debugStepOut()
+
+    def breakpoint(self, descriptor, dex_pc=0):
+        """Set a breakpoint at a method ('Lcom/foo/Bar;->m(...)V') and dex offset (code units)."""
+        d = descriptor.descriptor if isinstance(descriptor, _Node) else str(descriptor)
+        self._host.debugSetBreakpoint(d, int(dex_pc))
+
+    def clear_breakpoint(self, descriptor, dex_pc=0):
+        """Remove a previously set breakpoint."""
+        d = descriptor.descriptor if isinstance(descriptor, _Node) else str(descriptor)
+        self._host.debugClearBreakpoint(d, int(dex_pc))
+
+    def state(self):
+        """Current debugger state: 'detached', 'running' or 'stopped'."""
+        return self._host.debugState()
+
+    def frames(self):
+        """Call stack at the current stop as a list of {index, description, descriptor, dex_pc}."""
+        return [_as_dict(f) for f in self._host.debugFrames()]
+
+    def variables(self, frame_index=0):
+        """Local variables of a stack frame as a list of {name, type, value}."""
+        return [_as_dict(v) for v in self._host.debugVariables(int(frame_index))]
+
+    def read_memory(self, address, length):
+        """Read `length` bytes of target memory at `address`; None if unavailable."""
+        b = self._host.debugReadMemory(int(address), int(length))
+        return bytes(b) if b is not None else None
+
+    def write_memory(self, address, data):
+        """Write raw bytes to target memory at `address`. Returns True on success."""
+        return bool(self._host.debugWriteMemory(int(address), bytes(data)))
+
+    def runtime_addr(self, native_id, vaddr):
+        """Resolve a library vaddr ('libfoo.so', 0x1234) to its live runtime address; None if not loaded."""
+        return self._host.debugRuntimeAddr(str(native_id), int(vaddr))
+
+    def patch_native(self, native_id, vaddr, asm):
+        """Assemble `asm` for the target arch and write it over the instruction at native_id+vaddr (live). True on success."""
+        return bool(self._host.debugPatchNative(str(native_id), int(vaddr), str(asm)))
+
+    def wait_until_stopped(self, timeout=10.0, poll=0.05):
+        """Block until the debugger reports 'stopped' (a breakpoint/step hit) or `timeout` seconds
+        elapse. Returns True if stopped. Safe to call from a script after resume()."""
+        import time
+        deadline = time.monotonic() + float(timeout)
+        while time.monotonic() < deadline:
+            if self._host.debugState() == "stopped":
+                return True
+            time.sleep(float(poll))
+        return self._host.debugState() == "stopped"
+
+
 class _Jdex:
     """Top-level scripting facade, bound as `jdex`."""
 
     def __init__(self, host):
         self._host = host
         self.ui = _Ui(host)
+        self.debug = _Debug(host)
 
     def files(self):
         """Names of every file entry inside the loaded APK (or the dex name for a bare dex)."""
@@ -264,6 +358,11 @@ class _Jdex:
     def read_file(self, path):
         """Raw bytes of one APK entry by name; empty bytes if absent."""
         return self._host.readFile(str(path))
+
+    def assemble(self, asm, arch, address=0):
+        """Assemble instruction text to bytes for `arch` ('arm64','arm','x86','x86_64','mips','mips64'); None on error."""
+        b = self._host.assemble(str(asm), str(arch), int(address))
+        return bytes(b) if b is not None else None
 
     def import_file(self, name, data):
         """Add a file (bytes) under `name`, type auto-detected: a dex is merged into

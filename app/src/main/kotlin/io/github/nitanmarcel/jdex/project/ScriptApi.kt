@@ -10,6 +10,7 @@ class ScriptApi(
     private val onReanalyze: () -> Unit = {},
     private val fileImporter: (String, ByteArray) -> Unit = { _, _ -> },
     private val ui: ScriptUi = NoScriptUi,
+    private val debug: DebugControl = NoDebugControl,
 ) {
 
     private fun active(): ApkSession = session() ?: throw IllegalStateException("No APK or DEX loaded")
@@ -130,6 +131,50 @@ class ScriptApi(
 
     fun importFile(name: String, bytes: ByteArray) = fileImporter(name, bytes)
 
+    fun debugDevices(): List<Map<String, Any>> =
+        io.github.nitanmarcel.jdex.debug.DeviceBridge.devices()
+            .map { mapOf("serial" to it.serial, "label" to it.label, "online" to it.online) }
+
+    fun debugProcesses(serial: String): List<Map<String, Any>> =
+        io.github.nitanmarcel.jdex.debug.DeviceBridge.processes(serial)
+            .map { mapOf("pid" to it.pid, "name" to it.name) }
+
+    fun debugAttach(serial: String, pid: Int): Boolean = debug.attach(serial, pid)
+
+    fun debugDetach() = debug.detach()
+
+    fun debugResume() = debug.resume()
+
+    fun debugPause() = debug.pause()
+
+    fun debugStepInto() = debug.stepInto()
+
+    fun debugStepOver() = debug.stepOver()
+
+    fun debugStepOut() = debug.stepOut()
+
+    fun debugSetBreakpoint(descriptor: String, dexPc: Int) = debug.setBreakpoint(descriptor, dexPc)
+
+    fun debugClearBreakpoint(descriptor: String, dexPc: Int) = debug.clearBreakpoint(descriptor, dexPc)
+
+    fun debugState(): String = debug.state()
+
+    fun debugFrames(): List<Map<String, Any?>> = debug.frames()
+
+    fun debugVariables(frameIndex: Int): List<Map<String, Any?>> = debug.variables(frameIndex)
+
+    fun debugReadMemory(address: Long, length: Int): ByteArray? = debug.readMemory(address, length)
+
+    fun debugWriteMemory(address: Long, bytes: ByteArray): Boolean = debug.writeMemory(address, bytes)
+
+    fun debugRuntimeAddr(nativeId: String, vaddr: Long): Long? = debug.runtimeAddr(nativeId, vaddr)
+
+    fun debugPatchNative(nativeId: String, vaddr: Long, asm: String): Boolean = debug.patchNative(nativeId, vaddr, asm)
+
+    fun assemble(asm: String, arch: String, address: Long): ByteArray? =
+        runCatching { io.github.nitanmarcel.jdex.disasm.ElfArch.valueOf(arch.uppercase()) }.getOrNull()
+            ?.let { io.github.nitanmarcel.jdex.disasm.KeystoneAssembler.assemble(asm, address, it).getOrNull() }
+
     fun uiMessage(text: String, error: Boolean) = ui.message(text, error)
 
     fun uiInput(prompt: String, default: String): String? = ui.input(prompt, default)
@@ -142,6 +187,27 @@ class ScriptApi(
 
     fun jadx(): JadxDecompiler = active().decompiler()
 }
+
+interface DebugControl {
+    fun attach(serial: String, pid: Int): Boolean = false
+    fun detach() {}
+    fun resume() {}
+    fun pause() {}
+    fun stepInto() {}
+    fun stepOver() {}
+    fun stepOut() {}
+    fun setBreakpoint(descriptor: String, dexPc: Int) {}
+    fun clearBreakpoint(descriptor: String, dexPc: Int) {}
+    fun state(): String = "detached"
+    fun frames(): List<Map<String, Any?>> = emptyList()
+    fun variables(frameIndex: Int): List<Map<String, Any?>> = emptyList()
+    fun readMemory(address: Long, length: Int): ByteArray? = null
+    fun writeMemory(address: Long, bytes: ByteArray): Boolean = false
+    fun runtimeAddr(nativeId: String, vaddr: Long): Long? = null
+    fun patchNative(nativeId: String, vaddr: Long, asm: String): Boolean = false
+}
+
+object NoDebugControl : DebugControl
 
 interface ScriptUi {
     fun message(text: String, error: Boolean) {}

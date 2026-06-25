@@ -38,6 +38,16 @@ object Icons {
     val SAVE get() = of("save")
     val SETTINGS get() = of("settings-gear")
 
+    val REFRESH get() = of("refresh")
+    val DEBUG_CONTINUE get() = of("debug-continue")
+    val DEBUG_PAUSE get() = of("debug-pause")
+    val DEBUG_STEP_INTO get() = of("debug-step-into")
+    val DEBUG_STEP_OVER get() = of("debug-step-over")
+    val DEBUG_STEP_OUT get() = of("debug-step-out")
+    val DEBUG_STOP get() = of("debug-disconnect")
+    val DEBUG_EXCEPTION get() = of("warning")
+    val EDIT get() = of("edit")
+
     private class KindIcon(private val name: String, private val type: Int, private val fallback: Color) : Icon {
         private val tinted = HashMap<Int, FlatSVGIcon>()
         private val base = FlatSVGIcon("icons/$name.svg")

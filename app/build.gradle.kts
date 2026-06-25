@@ -13,6 +13,7 @@ repositories {
 
 dependencies {
     implementation(libs.apksig)
+    implementation(libs.ddmlib)
     implementation(libs.jna)
     implementation(project(":native"))
     implementation(libs.bined.swing)
@@ -28,6 +29,7 @@ dependencies {
     implementation(libs.graalpy.regex)
     implementation(libs.jadx.core)
     implementation(libs.jadx.dex.input)
+    implementation(libs.jdwp)
     implementation(libs.jungrapht.layout)
     implementation(libs.kotlinx.coroutines.swing)
     implementation(libs.miglayout.swing)

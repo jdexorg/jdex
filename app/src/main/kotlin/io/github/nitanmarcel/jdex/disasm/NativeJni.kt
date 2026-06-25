@@ -169,7 +169,7 @@ object NativeJni {
 
             val name = elf.cStringAt(namePtr) ?: return null
             val sig = elf.cStringAt(sigPtr) ?: return null
-            if (!isMethodName(name) || !isSignature(sig) || !inText(fnPtr)) return null
+            if (!isMethodName(name) || !JniDescriptor.isSignature(sig) || !inText(fnPtr)) return null
             out.add(fnPtr to JniNative(name, sig))
         }
         return out
@@ -191,7 +191,7 @@ object NativeJni {
             val fnPtr = (frame.slotPtr[e + 2 * cfg.ptrSize] ?: return null) and 1L.inv()
             val name = elf.cStringAt(namePtr) ?: return null
             val sig = elf.cStringAt(sigPtr) ?: return null
-            if (!isMethodName(name) || !isSignature(sig) || !inText(fnPtr)) return null
+            if (!isMethodName(name) || !JniDescriptor.isSignature(sig) || !inText(fnPtr)) return null
             out.add(fnPtr to JniNative(name, sig))
         }
         return out
@@ -231,28 +231,6 @@ object NativeJni {
     private fun isMethodName(s: String): Boolean =
         s.isNotEmpty() && s.length <= 200 && !s[0].isDigit() && s.all { it.isLetterOrDigit() || it == '_' || it == '$' }
 
-    private fun isSignature(s: String): Boolean {
-        if (!s.startsWith("(")) return false
-        val close = s.indexOf(')')
-        if (close < 1) return false
-        var i = 1
-        while (i < close) i = skipType(s, i, close, false) ?: return false
-        val r = skipType(s, close + 1, s.length, true) ?: return false
-        return r == s.length
-    }
-
-    private fun skipType(s: String, start: Int, end: Int, allowVoid: Boolean): Int? {
-        var j = start
-        while (j < end && s[j] == '[') j++
-        if (j >= end) return null
-        val arr = j > start
-        return when (s[j]) {
-            'Z', 'B', 'C', 'S', 'I', 'J', 'F', 'D' -> j + 1
-            'V' -> if (allowVoid && !arr) j + 1 else null
-            'L' -> s.indexOf(';', j + 1).let { semi -> if (semi in (j + 2) until end) semi + 1 else null }
-            else -> null
-        }
-    }
 
     internal enum class K { LOAD, STORE, LEA, MOVE, CALL_REG, CALL_MEM, CALL_DIR, CLOBBER, NONE }
     internal class Eff(val k: K, val dst: String? = null, val src: String? = null, val base: String? = null, val off: Long = 0, val target: Long? = null)

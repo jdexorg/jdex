@@ -12,9 +12,28 @@ object NativeJumpTable {
             ElfArch.ARM64 -> resolveArm64(insns, branchIdx, elf)
             ElfArch.X86_64, ElfArch.X86 -> resolveX86(insns, branchIdx, elf)
             ElfArch.MIPS -> resolveMips(insns, branchIdx, elf)
-            ElfArch.ARM -> resolveArmThumb(insns, branchIdx, elf)
+            ElfArch.ARM -> resolveArmThumb(insns, branchIdx, elf) ?: resolveArmLdrPc(insns, branchIdx, elf)
             else -> null
         }
+    }
+
+    private fun resolveArmLdrPc(insns: List<Insn>, k: Int, elf: ElfFile): Result? {
+        val branch = insns[k]
+        if (coreMnem(branch.mnemonic) != "ldr") return null
+        val ops = split(branch.operands)
+        if (ops.size != 2 || ops[0].lowercase() != "pc") return null
+        val parts = (inside(ops[1]) ?: return null).split(",").map { it.trim() }
+        if (parts.firstOrNull()?.lowercase() != "pc") return null
+        val idxReg = parts.getOrNull(1)?.let { stripShift(it) }?.takeIf { it.isNotEmpty() } ?: return null
+        val base = branch.address + 8
+        val count = boundFromArmCmp(insns, k, maxOf(0, k - 8), idxReg) ?: return null
+        val targets = ArrayList<Long>(count)
+        for (i in 0 until count) {
+            val t = (elf.readInt(base + i.toLong() * 4)?.toLong()?.and(0xFFFFFFFFL) ?: return null) and 0xFFFFFFFEL
+            if (!inExec(elf, t)) return null
+            targets.add(t)
+        }
+        return Result(idxReg, targets)
     }
 
     private fun resolveArmThumb(insns: List<Insn>, k: Int, elf: ElfFile): Result? {

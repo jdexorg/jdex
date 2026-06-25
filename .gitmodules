@@ -1,3 +1,10 @@
 [submodule "native/capstone"]
 	path = native/capstone
 	url = https://github.com/capstone-engine/capstone
+[submodule "native/jrunas"]
+	path = native/jrunas
+	url = https://github.com/jdexorg/jrunas
+[submodule "native/keystone"]
+	path = native/keystone
+	url = https://github.com/jdexorg/keystone
+	branch = master

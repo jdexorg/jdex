@@ -120,14 +120,79 @@ class _Ui:
         ...
 
 
+class _Debug:
+    """Debugger control: attach, set breakpoints, step, inspect frames/locals."""
+    def devices(self) -> list[dict]:
+        """Connected devices/emulators as {serial, label, online} dicts."""
+        ...
+    def processes(self, serial: str) -> list[dict]:
+        """Running app processes on a device as {pid, name} dicts."""
+        ...
+    def attach(self, serial: str, pid: int) -> bool:
+        """Attach the debugger to process `pid` on device `serial`. True on success."""
+        ...
+    def detach(self) -> None:
+        """Detach the debugger and let the process run freely."""
+        ...
+    def resume(self) -> None:
+        """Resume execution after a stop."""
+        ...
+    def pause(self) -> None:
+        """Suspend the process at its current point."""
+        ...
+    def step_into(self) -> None:
+        """Step into the next call."""
+        ...
+    def step_over(self) -> None:
+        """Step over the next line."""
+        ...
+    def step_out(self) -> None:
+        """Step out of the current method."""
+        ...
+    def breakpoint(self, descriptor, dex_pc: int = 0) -> None:
+        """Set a breakpoint at a method descriptor (or Method) and dex offset (code units)."""
+        ...
+    def clear_breakpoint(self, descriptor, dex_pc: int = 0) -> None:
+        """Remove a previously set breakpoint."""
+        ...
+    def state(self) -> str:
+        """Current debugger state: 'detached', 'running' or 'stopped'."""
+        ...
+    def frames(self) -> list[dict]:
+        """Call stack at the current stop as {index, description, descriptor, dex_pc} dicts."""
+        ...
+    def variables(self, frame_index: int = 0) -> list[dict]:
+        """Local variables of a stack frame as {name, type, value} dicts."""
+        ...
+    def wait_until_stopped(self, timeout: float = 10.0, poll: float = 0.05) -> bool:
+        """Block until the debugger is 'stopped' or `timeout` seconds elapse. True if stopped."""
+        ...
+    def read_memory(self, address: int, length: int) -> bytes | None:
+        """Read `length` bytes of target memory at `address`; None if unavailable."""
+        ...
+    def write_memory(self, address: int, data: bytes) -> bool:
+        """Write raw bytes to target memory at `address`. True on success."""
+        ...
+    def runtime_addr(self, native_id: str, vaddr: int) -> int | None:
+        """Resolve a library vaddr ('libfoo.so', 0x1234) to its live runtime address; None if not loaded."""
+        ...
+    def patch_native(self, native_id: str, vaddr: int, asm: str) -> bool:
+        """Assemble `asm` for the target arch and write it over the instruction at native_id+vaddr (live). True on success."""
+        ...
+
+
 class _Jdex:
     """Top-level scripting facade, bound as `jdex`."""
     ui: _Ui
+    debug: _Debug
     def files(self) -> list[str]:
         """Names of every file entry inside the loaded APK (or the dex name for a bare dex)."""
         ...
     def read_file(self, path: str) -> bytes:
         """Raw bytes of one APK entry by name; empty bytes if absent."""
+        ...
+    def assemble(self, asm: str, arch: str, address: int = 0) -> bytes | None:
+        """Assemble instruction text to bytes for `arch` ('arm64','arm','x86','x86_64','mips','mips64'); None on error."""
         ...
     def import_file(self, name: str, data: bytes) -> None:
         """Add a file (bytes) under `name`, type auto-detected: dex -> analysis,

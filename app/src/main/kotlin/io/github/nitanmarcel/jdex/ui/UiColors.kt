@@ -16,5 +16,9 @@ object UiColors {
 
     fun info(): Color = UIManager.getColor("Actions.Blue") ?: Color(0x3592C4)
 
+    fun warning(): Color = UIManager.getColor("Actions.Yellow") ?: UIManager.getColor("Component.warning.focusedBorderColor") ?: Color(0xE5, 0x6B, 0x1E)
+
+    fun disabled(): Color = UIManager.getColor("Label.disabledForeground") ?: UIManager.getColor("textInactiveText") ?: Color(0x99, 0x99, 0x99)
+
     fun alpha(c: Color, a: Int): Color = Color(c.red, c.green, c.blue, a)
 }

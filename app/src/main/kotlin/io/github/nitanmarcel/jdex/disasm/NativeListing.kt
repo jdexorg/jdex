@@ -17,6 +17,7 @@ object NativeListing {
         progress: (Int, Int) -> Unit,
         cancel: () -> Boolean,
         header: List<String> = emptyList(),
+        onAnalysis: (NativeJni.Analysis) -> Unit = {},
     ): LineSource? {
         val sections = (elf.textSections + elf.dataSections).sortedBy { it.addr }
         if (sections.isEmpty()) return null
@@ -28,6 +29,7 @@ object NativeListing {
         NativeFunctions.detectArmMode(elf, disassembler, littleEndian)
         val discovered = NativeFunctions.discover(elf, disassembler, arch, littleEndian)
         val jni = NativeJni.analyze(elf, disassembler, arch, littleEndian, discovered)
+        onAnalysis(jni)
         val starts = (discovered.toList() + jni.envFns.keys).distinct().sorted().toLongArray()
         val names = HashMap<Long, String>(starts.size * 2)
         for (s in starts) names[s] = symbols[s]?.name ?: jni.registered[s]?.name ?: "sub_${s.toString(16)}"
@@ -225,6 +227,16 @@ object NativeListing {
                         return resolveData(addr, names, elf) ?: "off_${addr.toString(16)}"
                     }
                 }
+            }
+            elf.arch == ElfArch.X86 && ops.size == 2 && '[' in ops[1] && "ebx" in ops[1] -> {
+                val inner = ops[1].substringAfter('[').substringBefore(']').trim().lowercase()
+                val rest = inner.removePrefix("ebx").replace(" ", "")
+                if (rest.isNotEmpty() && !Regex("^[+-](0x[0-9a-f]+|\\d+)$").matches(rest)) return null
+                val gotBase = (elf.sections.firstOrNull { it.name == ".got.plt" } ?: elf.sections.firstOrNull { it.name == ".got" })?.addr ?: return null
+                val ea = gotBase + (signedHex(rest) ?: 0L)
+                val inGot = elf.sections.any { (it.name == ".got" || it.name == ".got.plt") && ea >= it.addr && ea < it.addr + it.size }
+                val target = if (inGot) elf.relocatedPointerAt(ea) ?: return null else ea
+                return resolveData(target, names, elf)
             }
             ops.isNotEmpty() && m in WRITES_DEST -> adrp.remove(ops[0])
         }

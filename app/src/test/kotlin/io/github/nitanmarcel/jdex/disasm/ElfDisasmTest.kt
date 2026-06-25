@@ -198,7 +198,7 @@ class ElfDisasmTest {
         val buf = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
         buf.putLong(0, 0x1000L); buf.putLong(8, 0xBL)
         val slots = ArrayList<Long>()
-        ElfFile.parseRelr(bytes, 0, bytes.size, true) { slots.add(it) }
+        ElfFile.parseRelr(bytes, 0, bytes.size, true, true) { slots.add(it) }
         assertEquals(listOf(0x1000L, 0x1008L, 0x1018L), slots)
     }
 
@@ -526,7 +526,7 @@ class ElfDisasmTest {
     fun jaeGuardGivesExclusiveCaseCount() {
         val bytes = ByteArray(0x2020)
         val buf = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        buf.putLong(0x2000, 0x1100); buf.putLong(0x2008, 0x1200); buf.putLong(0x2010, 0x1300) // 0x2018 stays 0 (invalid)
+        buf.putLong(0x2000, 0x1100); buf.putLong(0x2008, 0x1200); buf.putLong(0x2010, 0x1300)
         val elf = elfWith(ElfArch.X86_64, listOf(section(".text", 0x1000, 0x1000, true), section(".rodata", 0x2000, 0x100, false)), bytes)
         val insns = listOf(
             Insn(0xfe8, 3, ByteArray(3), "cmp", "edi, 3"),

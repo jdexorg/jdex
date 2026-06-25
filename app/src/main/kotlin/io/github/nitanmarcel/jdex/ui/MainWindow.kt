@@ -14,7 +14,23 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.swing.Swing
 import kotlinx.coroutines.withContext
 import io.github.nitanmarcel.jdex.RecentFiles
+import io.github.nitanmarcel.jdex.debug.Breakpoint
+import io.github.nitanmarcel.jdex.debug.DebugDevice
+import io.github.nitanmarcel.jdex.debug.DebugLocation
+import io.github.nitanmarcel.jdex.debug.DebugProcess
+import io.github.nitanmarcel.jdex.debug.DebugSession
+import io.github.nitanmarcel.jdex.debug.DebugState
+import io.github.nitanmarcel.jdex.debug.DebugVar
+import io.github.nitanmarcel.jdex.debug.ArtSession
+import io.github.nitanmarcel.jdex.debug.NativeSession
+import io.github.nitanmarcel.jdex.debug.MixedSession
+import io.github.nitanmarcel.jdex.debug.NativeDebug
+import io.github.nitanmarcel.jdex.debug.DeviceBridge
+import io.github.nitanmarcel.jdex.debug.RegisterMeta
+import io.github.nitanmarcel.jdex.project.DebugControl
+import io.github.nitanmarcel.jdex.disasm.CapstoneDisassembler
 import io.github.nitanmarcel.jdex.disasm.JniName
+import io.github.nitanmarcel.jdex.disasm.KeystoneAssembler
 import io.github.nitanmarcel.jdex.project.ApkSession
 import io.github.nitanmarcel.jdex.project.BinaryContent
 import io.github.nitanmarcel.jdex.project.CodeContent
@@ -25,7 +41,9 @@ import io.github.nitanmarcel.jdex.project.Dex
 import io.github.nitanmarcel.jdex.project.DexPatch
 import io.github.nitanmarcel.jdex.project.HMembers
 import io.github.nitanmarcel.jdex.project.MalformedDex
+import io.github.nitanmarcel.jdex.project.BreakpointStore
 import io.github.nitanmarcel.jdex.project.NoBookmarks
+import io.github.nitanmarcel.jdex.project.NoBreakpoints
 import io.github.nitanmarcel.jdex.project.NoComments
 import io.github.nitanmarcel.jdex.project.NoDexStore
 import io.github.nitanmarcel.jdex.project.NoRenames
@@ -84,7 +102,85 @@ class MainWindow : JFrame("jdex") {
     private var dexBytecodeView: VirtualCodeView? = null
     private var hierarchyClasses: List<io.github.nitanmarcel.jdex.project.HClass> = emptyList()
     private var hierarchyNativeView: VirtualCodeView? = null
+    private val nativeViewByBase = HashMap<String, Pair<EditorTab, VirtualCodeView>>()
+    private val nativeAnalyses = HashMap<String, io.github.nitanmarcel.jdex.disasm.NativeJni.Analysis>()
+    private val nativeExports = HashMap<String, Map<String, Long>>()
+    private val nativeSymbols = HashMap<String, List<io.github.nitanmarcel.jdex.disasm.ElfSymbol>>()
+    private val nativeArch = HashMap<String, io.github.nitanmarcel.jdex.disasm.ElfArch>()
     private lateinit var scripting: ScriptPanel
+    private lateinit var debugBar: DebugToolBar
+    private lateinit var debugViews: DebugViews
+    @Volatile private var debugSession: DebugSession? = null
+    private var attaching = false
+    private var enablingNative = false
+    private var attachedDevice: DebugDevice? = null
+    private var attachedProc: DebugProcess? = null
+    private val debugPrefs = java.util.prefs.Preferences.userRoot().node("jdex/ui/debug")
+
+    private val debugControl = object : DebugControl {
+        override fun attach(serial: String, pid: Int): Boolean {
+            if (debugSession != null) { log.warning("Already attached; detach first"); return false }
+            val dev = runCatching { DeviceBridge.devices() }.getOrNull()?.firstOrNull { it.serial == serial }
+                ?: DebugDevice(serial, serial, true)
+            val s = runCatching { ArtSession.attach(dev, DeviceBridge.androidRelease(dev.serial), pid, ::registerMetaFor) }.getOrElse { e ->
+                log.warning("Attach failed: ${e.message}"); return false
+            }
+            onEdt {
+                debugSession = s
+                s.onStateChange { st -> SwingUtilities.invokeLater { onDebugState(st) } }
+                breakpointStore().breakpoints().forEach { bp -> s.addBreakpoint(Breakpoint.Dex(bp.descriptor, bp.dexPc)) }
+                s.setExceptionBreak(false, debugBar.exceptionBreakEnabled())
+                debugBar.setState(s.state)
+                showDebugViews()
+            }
+            return true
+        }
+
+        override fun detach() = onEdt { debugSession?.detach() ?: Unit }
+        override fun resume() = onEdt { debugSession?.resume() ?: Unit }
+        override fun pause() = onEdt { debugSession?.pause() ?: Unit }
+        override fun stepInto() = onEdt { debugSession?.stepInto() ?: Unit }
+        override fun stepOver() = onEdt { debugSession?.stepOver() ?: Unit }
+        override fun stepOut() = onEdt { debugSession?.stepOut() ?: Unit }
+
+        override fun setBreakpoint(descriptor: String, dexPc: Int): Unit = onEdt {
+            onBreakpointToggled(descriptor, dexPc, true)
+            dexBytecodeView?.markBreakpoints(breakpointStore().breakpoints().map { it.descriptor to it.dexPc })
+            Unit
+        }
+
+        override fun clearBreakpoint(descriptor: String, dexPc: Int): Unit = onEdt {
+            onBreakpointToggled(descriptor, dexPc, false)
+            dexBytecodeView?.markBreakpoints(breakpointStore().breakpoints().map { it.descriptor to it.dexPc })
+            Unit
+        }
+
+        override fun state(): String = when (debugSession?.state) {
+            null, DebugState.Detached -> "detached"
+            DebugState.Running -> "running"
+            is DebugState.Stopped -> "stopped"
+        }
+
+        override fun frames(): List<Map<String, Any?>> = debugSession?.frames().orEmpty().map { f ->
+            val loc = f.location as? DebugLocation.Dex
+            mapOf("index" to f.index, "description" to f.description, "descriptor" to loc?.methodDescriptor, "dex_pc" to loc?.dexPc)
+        }
+
+        override fun variables(frameIndex: Int): List<Map<String, Any?>> =
+            debugSession?.variables(frameIndex).orEmpty().map { mapOf("name" to it.name, "type" to it.type, "value" to it.value) }
+
+        override fun readMemory(address: Long, length: Int): ByteArray? = debugSession?.readMemory(address, length)
+        override fun writeMemory(address: Long, bytes: ByteArray): Boolean = debugSession?.writeMemory(address, bytes) ?: false
+        override fun runtimeAddr(nativeId: String, vaddr: Long): Long? = debugSession?.runtimeAddr(nativeId, vaddr)
+
+        override fun patchNative(nativeId: String, vaddr: Long, asm: String): Boolean {
+            val s = debugSession ?: return false
+            val rt = s.runtimeAddr(nativeId, vaddr) ?: return false
+            val arch = nativeArch[nativeId] ?: return false
+            val bytes = KeystoneAssembler.assemble(asm, rt, arch).getOrElse { log.warning("Patch assemble: ${it.message}"); return false }
+            return s.writeMemory(rt, bytes)
+        }
+    }
 
     init {
         defaultCloseOperation = DO_NOTHING_ON_CLOSE
@@ -94,6 +190,7 @@ class MainWindow : JFrame("jdex") {
         addWindowListener(object : WindowAdapter() {
             override fun windowClosing(e: WindowEvent) {
                 if (!confirmDiscardChanges()) return
+                runCatching { debugSession?.detach() }
                 runCatching { clearEditors() }
                 runCatching { AppState.persist() }
                 runCatching { scope.cancel() }
@@ -105,7 +202,28 @@ class MainWindow : JFrame("jdex") {
         })
 
         Docking.initialize(this)
+        debugBar = DebugToolBar(
+            onAttach = { dev, proc -> attachDebugger(dev, proc) },
+            onResume = { debugSession?.resume() },
+            onPause = { debugSession?.pause() },
+            onStepInto = { debugSession?.stepInto() },
+            onStepOver = { debugSession?.stepOver() },
+            onStepOut = { debugSession?.stepOut() },
+            onDetach = { debugSession?.detach() },
+            onExceptionBreak = { enabled -> debugSession?.setExceptionBreak(false, enabled) },
+            packageHint = { session?.appPackage },
+            log = { log.warning(it) },
+        )
+        add(debugBar, java.awt.BorderLayout.NORTH)
         add(RootDockingPanel(this))
+        debugViews = DebugViews(
+            onFrameSelected = { _, location, vars -> revealDebugLocation(location); updateInlineValues(location, vars) },
+            onSetValue = { key, text -> debugSession?.setValue(key, text) ?: false },
+            onOpenModule = ::openDeviceModule,
+            isPointer = { debugSession?.looksLikePointer(it) ?: false },
+        )
+        debugViews.memory.readMem = { a, n -> debugSession?.readMemory(a, n) }
+        debugViews.memory.addrResolver = ::resolveMemoryAddress
 
         val editors = EditorAnchor()
         explorer = FilesPanel(::openView, onFindUsages = ::findInBytecode, onOpenDex = ::openDexEditor)
@@ -126,6 +244,7 @@ class MainWindow : JFrame("jdex") {
             dexStore = { project ?: NoDexStore },
             onReanalyze = { SwingUtilities.invokeLater { analyze() } },
             fileImporter = { name, bytes -> SwingUtilities.invokeLater { importFile(name, bytes) } },
+            debug = debugControl,
             ui = object : ScriptUi {
                 override fun message(text: String, error: Boolean) = SwingUtilities.invokeLater {
                     JOptionPane.showMessageDialog(
@@ -218,6 +337,13 @@ class MainWindow : JFrame("jdex") {
             add(viewItem("Scripting", scripting) {
                 if (Docking.isDocked(logger)) Docking.dock(scripting, logger, DockingRegion.CENTER)
                 else Docking.dock(scripting, this@MainWindow, DockingRegion.SOUTH, 0.25)
+            })
+            add(JMenu("Debugger").apply {
+                add(viewItem("Threads", debugViews.threads) { dockDebugView(debugViews.threads) })
+                add(viewItem("Call Stack", debugViews.frames) { dockDebugView(debugViews.frames) })
+                add(viewItem("Variables", debugViews.variables) { dockDebugView(debugViews.variables) })
+                add(viewItem("Libraries", debugViews.libraries) { dockDebugView(debugViews.libraries) })
+                add(viewItem("Memory", debugViews.memory) { dockDebugView(debugViews.memory) })
             })
         })
         add(JMenu("Appearance").apply {
@@ -500,6 +626,22 @@ class MainWindow : JFrame("jdex") {
         return area
     }
 
+    private fun openDeviceModule(module: io.github.nitanmarcel.jdex.debug.LoadedModule) {
+        val serial = debugSession?.device?.serial ?: run { log.warning("Not attached to a device"); return }
+        log.info("Pulling ${module.path} from device…")
+        Thread {
+            val tmp = java.io.File.createTempFile("jdex-dev-", "-${module.name}")
+            val bytes = runCatching {
+                DeviceBridge.pullFile(serial, module.path, tmp.absolutePath); tmp.readBytes()
+            }.getOrElse { e ->
+                SwingUtilities.invokeLater { log.warning("Could not pull ${module.path}: ${e.message}") }
+                tmp.delete(); return@Thread
+            }
+            tmp.delete()
+            SwingUtilities.invokeLater { openNative("dev:${module.name}", module.name, NativeContent(module.name, bytes)) }
+        }.apply { isDaemon = true }.start()
+    }
+
     private fun openNative(tabId: String, title: String, content: NativeContent) {
         val elf = io.github.nitanmarcel.jdex.disasm.ElfFile.parse(content.bytes)
         if (elf == null) {
@@ -522,8 +664,12 @@ class MainWindow : JFrame("jdex") {
             .sortedBy { it.addr }
             .map { (it.name.ifEmpty { "seg_${it.addr.toString(16)}" }) to it.addr }
         val info = buildNativeInfo(elf, content.bytes, choice.arch, choice.littleEndian)
+        val nbase = nativeId.split(':').getOrNull(1) ?: nativeId
+        nativeExports[nbase] = elf.functions.filter { it.name.startsWith("Java_") }.associate { it.name to it.address }
+        nativeSymbols[nbase] = elf.functions
+        nativeArch[nbase] = choice.arch
         val code = CodeContent(Syntax.ASM, x86Is32, nativeId, segments, info) { progress, cancel ->
-            io.github.nitanmarcel.jdex.disasm.NativeListing.build(elf, choice.disassembler, choice.arch, choice.littleEndian, progress, cancel, info.summary)
+            io.github.nitanmarcel.jdex.disasm.NativeListing.build(elf, choice.disassembler, choice.arch, choice.littleEndian, progress, cancel, info.summary) { nativeAnalyses[nbase] = it }
         }
         openCode(tabId, title, code)
     }
@@ -606,11 +752,31 @@ class MainWindow : JFrame("jdex") {
                     if (content.syntax == Syntax.ASM) {
                         nativeViews.add(Triple(tab, view, source))
                         content.nativeId?.let { renames.setNativeJniBindings(it, buildJniBindings(source)) }
+                        val base = content.nativeId?.split(':')?.getOrNull(1)
+                        if (base != null) {
+                            nativeViewByBase[base] = tab to view
+                            view.onToggleNativeBreakpoint = { vaddr, added ->
+                                val bp = Breakpoint.Native(base, vaddr)
+                                when {
+                                    debugSession is ArtSession && added -> enableNativeDebugging()
+                                    else -> if (added) debugSession?.addBreakpoint(bp) else debugSession?.removeBreakpoint(bp)
+                                }
+                            }
+                            view.onRunToCursorNative = { off -> debugSession?.runToCursorNative(base, off) }
+                            view.onViewMemoryNative = ::viewMemoryFromOperand
+                            view.onPatchNative = { vaddr -> patchNativeAtVaddr(base, vaddr) }
+                            view.nativePatchEnabled = { debugSession != null && KeystoneAssembler.available() }
+                            view.onEnableNative = { enableNativeDebugging() }
+                            view.nativeEnableVisible = { debugSession is ArtSession }
+                        }
                     } else {
                         bytecodeTab = tab
                         bytecodeView = view
                         dexBytecodeTab = tab
                         dexBytecodeView = view
+                        view.onToggleBreakpoint = { desc, dexPc, added -> onBreakpointToggled(desc, dexPc, added) }
+                        view.onRunToCursor = { desc, dexPc -> debugSession?.runToCursor(desc, dexPc) }
+                        view.markBreakpoints(breakpointStore().breakpoints().map { it.descriptor to it.dexPc })
                     }
                     view.syncApprox = syncState == FlatTriStateCheckBox.State.INDETERMINATE
                     Docking.dock(tab, "editors", DockingRegion.CENTER)
@@ -632,6 +798,11 @@ class MainWindow : JFrame("jdex") {
         }
         openTabs.clear()
         nativeViews.clear()
+        nativeViewByBase.clear()
+        nativeAnalyses.clear()
+        nativeExports.clear()
+        nativeSymbols.clear()
+        nativeArch.clear()
         bytecodeTab = null
         bytecodeView = null
         dexBytecodeTab = null
@@ -776,6 +947,324 @@ class MainWindow : JFrame("jdex") {
         val view = bytecodeView ?: return
         if (Docking.isDocked(tab)) Docking.bringToFront(tab)
         action(view)
+    }
+
+    private fun attachDebugger(dev: DebugDevice, proc: DebugProcess) {
+        if (debugSession != null || attaching) { log.warning("Already attaching/attached; detach first"); return }
+        attaching = true
+        log.info("Attaching to ${proc.name} (pid ${proc.pid}) on ${dev.serial}…")
+        val dexBps = breakpointStore().breakpoints().map { Breakpoint.Dex(it.descriptor, it.dexPc) }
+        Thread {
+            DeviceBridge.useJrunas(null)
+            val s = runCatching { ArtSession.attach(dev, DeviceBridge.androidRelease(dev.serial), proc.pid, ::registerMetaFor) }.getOrElse { e ->
+                SwingUtilities.invokeLater { attaching = false; log.warning("Attach failed: ${e.message}") }
+                return@Thread
+            }
+            SwingUtilities.invokeLater {
+                attaching = false
+                attachedDevice = dev; attachedProc = proc
+                debugSession = s
+                s.onStateChange { st -> SwingUtilities.invokeLater { onDebugState(st) } }
+                dexBps.forEach { s.addBreakpoint(it) }
+                s.setExceptionBreak(false, debugBar.exceptionBreakEnabled())
+                debugBar.setState(s.state)
+                showDebugViews()
+                onDebugState(s.state)
+                log.info("Attached to ${proc.name} (pid ${proc.pid}) — native debugging off; open a .so and enable it to attach the native debugger")
+            }
+        }.start()
+    }
+
+    private fun enableNativeDebugging(then: (() -> Unit)? = null) {
+        val art = debugSession as? ArtSession ?: run {
+            if (debugSession is MixedSession) then?.invoke() else log.warning("Attach a debugger first")
+            return
+        }
+        if (art.state is DebugState.Stopped) { log.warning("Resume before enabling native debugging"); return }
+        if (nativeViewByBase.isEmpty()) { log.warning("Open a native library (.so) first"); return }
+        val dev = attachedDevice ?: return
+        val proc = attachedProc ?: return
+        if (enablingNative) return
+        enablingNative = true
+        Thread {
+            DeviceBridge.useJrunas(null)
+            val devAbi = DeviceBridge.deviceAbi(dev.serial)
+            val picked = arrayOfNulls<NativeDebug>(1)
+            runCatching { SwingUtilities.invokeAndWait { picked[0] = DebugConfigDialog.show(this@MainWindow, devAbi) } }
+            val nativeDebug = picked[0] ?: run { SwingUtilities.invokeLater { enablingNative = false; log.info("Native debugging cancelled") }; return@Thread }
+            if (nativeDebug is NativeDebug.Managed && !runCatching { DeviceBridge.isDebuggable(dev.serial, proc.name) }.getOrDefault(true) && !setUpRootDebug(dev, proc.name)) {
+                SwingUtilities.invokeLater { enablingNative = false }; return@Thread
+            }
+            abiToArch(devAbi)?.let { devArch ->
+                nativeArch.filterValues { it != devArch }.forEach { (base, a) ->
+                    SwingUtilities.invokeLater { log.warning("'$base' was disassembled as ${a.name} but the device ABI is $devAbi — its breakpoints/symbols will be mis-bound; re-open the matching .so") }
+                }
+            }
+            val bindingMap = io.github.nitanmarcel.jdex.debug.BindingMap()
+            val dexNatives = dexNativeMethods()
+            nativeAnalyses.forEach { (base, an) -> bindingMap.add(base, an, nativeExports[base] ?: emptyMap(), dexNatives) }
+            val nativeBps = nativeViewByBase.flatMap { (base, tv) -> tv.second.nativeBreakpointSet().map { Breakpoint.Native(base, it) } }
+            val s = runCatching {
+                MixedSession.upgrade(art, dev, proc.name, proc.pid, nativeDebug, nativeBps, bindingMap, ::symbolizeNative) { m -> SwingUtilities.invokeLater { log.info(m) } }
+            }.getOrElse { e ->
+                SwingUtilities.invokeLater { enablingNative = false; log.warning("Enable native debugging failed: ${e.message}") }
+                return@Thread
+            }
+            SwingUtilities.invokeLater {
+                enablingNative = false
+                debugSession = s
+                s.onStateChange { st -> SwingUtilities.invokeLater { onDebugState(st) } }
+                s.setExceptionBreak(false, debugBar.exceptionBreakEnabled())
+                debugBar.setState(s.state)
+                onDebugState(s.state)
+                log.info("Native debugging enabled (${bindingMap.allEntries().size} binding entr(ies))")
+                then?.invoke()
+            }
+        }.start()
+    }
+
+    private fun setUpRootDebug(dev: DebugDevice, pkg: String): Boolean {
+        if (!debugPrefs.getBoolean("skipNonDebuggableDialog", false)) {
+            val choice = arrayOfNulls<RootDebugDialog.Choice>(1)
+            runCatching { SwingUtilities.invokeAndWait { choice[0] = RootDebugDialog.show(this, pkg) } }
+            val c = choice[0]
+            if (c == null || !c.proceed) { SwingUtilities.invokeLater { log.info("$pkg is not debuggable — native debugging skipped") }; return false }
+            if (c.dontShowAgain) debugPrefs.putBoolean("skipNonDebuggableDialog", true)
+        }
+        if (!DeviceBridge.hasRoot(dev.serial)) {
+            runCatching {
+                SwingUtilities.invokeAndWait {
+                    JOptionPane.showMessageDialog(this,
+                        "$pkg is not debuggable and this device is not rooted.\n\n" +
+                            "Debugging a non-debuggable app needs a rooted device or an emulator, " +
+                            "or install a debuggable build of the APK.",
+                        "Cannot debug", JOptionPane.ERROR_MESSAGE)
+                }
+            }
+            SwingUtilities.invokeLater { log.warning("$pkg is not debuggable and the device is not rooted") }
+            return false
+        }
+        val abi = DeviceBridge.deviceAbi(dev.serial)
+        val jr = io.github.nitanmarcel.jdex.debug.Jrunas.extract(abi)
+            ?: run { SwingUtilities.invokeLater { log.warning("jrunas not bundled for $abi") }; return false }
+        DeviceBridge.useJrunas(DeviceBridge.pushJrunas(dev.serial, jr.absolutePath))
+        SwingUtilities.invokeLater { log.info("Using jrunas for $pkg (non-debuggable)") }
+        return true
+    }
+
+    private fun showDebugViews() {
+        if (debugViews.dockables.none { Docking.isDocked(it) }) {
+            Docking.dock(debugViews.threads, this, DockingRegion.EAST, 0.28)
+            Docking.dock(debugViews.frames, debugViews.threads, DockingRegion.CENTER)
+            Docking.dock(debugViews.variables, debugViews.threads, DockingRegion.CENTER)
+            Docking.dock(debugViews.libraries, debugViews.threads, DockingRegion.CENTER)
+            Docking.dock(debugViews.memory, debugViews.threads, DockingRegion.CENTER)
+        }
+        Docking.bringToFront(debugViews.threads)
+    }
+
+    private fun dockDebugView(d: Dockable) {
+        val anchor = debugViews.dockables.firstOrNull { it !== d && Docking.isDocked(it) }
+        if (anchor != null) Docking.dock(d, anchor, DockingRegion.CENTER)
+        else Docking.dock(d, this, DockingRegion.EAST, 0.28)
+    }
+
+    private fun onDebugState(state: DebugState) {
+        debugBar.setState(state)
+        when (state) {
+            is DebugState.Stopped -> {
+                val s = debugSession ?: return
+                debugViews.showStopped(
+                    { s.threads() },
+                    { threadId -> s.frames(threadId) },
+                    { threadId, idx -> s.variables(threadId, idx) },
+                    { ref -> s.children(ref) },
+                    { s.modules() },
+                )
+                revealDebugLocation(state.location)
+            }
+            DebugState.Running -> {
+                debugViews.clear()
+                dexBytecodeView?.clearDebugLine()
+                nativeViewByBase.values.forEach { it.second.clearDebugLine() }
+            }
+            DebugState.Detached -> {
+                debugSession = null
+                debugViews.clear()
+                dexBytecodeView?.clearDebugLine()
+                nativeViewByBase.values.forEach { it.second.clearDebugLine() }
+                log.info("Debugger detached")
+            }
+        }
+    }
+
+    private fun updateInlineValues(location: DebugLocation, vars: List<DebugVar>) {
+        val view = when (location) {
+            is DebugLocation.Dex -> dexBytecodeView
+            is DebugLocation.Native -> nativeViewByBase[location.nativeId]?.second
+        } ?: return
+        val map = HashMap<String, String>()
+        debugSession?.let { s -> runCatching { map.putAll(s.inlineValues()) } }
+        val paramToken = Regex("p\\d+")
+        val popup = StringBuilder()
+        for (v in vars) {
+            if (v.ref < 0) continue
+            val inline = escapeForLine(when {
+                v.id != 0L -> "id=${v.id}"
+                v.type == "java.lang.String" -> v.value
+                else -> v.editValue ?: v.value
+            })
+            map[v.name.substringBefore(" ")] = inline
+            paramToken.find(v.name)?.let { map[it.value] = inline }
+            popup.append(popupLine(v)).append('\n')
+        }
+        view.setDebugInlineValues(map)
+        view.setDebugPopup(popup.toString().trimEnd('\n').ifEmpty { null })
+    }
+
+    private fun popupLine(v: DebugVar): String {
+        val t = v.type.substringAfterLast('.')
+        val id = if (v.id != 0L) " (id=${v.id})" else ""
+        return when {
+            v.type.isEmpty() -> "${v.name} = ${v.value}"
+            v.id != 0L && v.value == t -> "${v.name}: $t$id"
+            else -> "${v.name}: $t = ${v.value}$id"
+        }
+    }
+
+    private fun revealDebugLocation(location: DebugLocation) {
+        when (location) {
+            is DebugLocation.Dex -> {
+                val tab = dexBytecodeTab ?: return
+                val view = dexBytecodeView ?: return
+                val cls = location.methodDescriptor.substringBefore("->").removePrefix("L").removeSuffix(";").replace('/', '.')
+                if (Docking.isDocked(tab)) Docking.bringToFront(tab)
+                view.revealDexLocation(cls, location.methodDescriptor.substringAfter("->"), location.dexPc)
+            }
+            is DebugLocation.Native -> {
+                val id = location.nativeId ?: return
+                val (tab, view) = nativeViewByBase[id] ?: return
+                if (Docking.isDocked(tab)) Docking.bringToFront(tab)
+                nativeViewByBase.values.forEach { it.second.clearDebugLine() }
+                view.revealNativeLocation(location.fileOffset)
+            }
+        }
+    }
+
+    private fun dexNativeMethods(): List<io.github.nitanmarcel.jdex.debug.DexNativeMethod> {
+        val jadx = session?.decompiler() ?: return emptyList()
+        val out = ArrayList<io.github.nitanmarcel.jdex.debug.DexNativeMethod>()
+        for (cls in jadx.root.classes) {
+            for (mth in cls.methods) {
+                if (!mth.accessFlags.isNative) continue
+                val mi = mth.methodInfo
+                val raw = mi.declClass.rawName.replace('.', '/')
+                val shortId = mi.shortId
+                out.add(io.github.nitanmarcel.jdex.debug.DexNativeMethod("L$raw;->$shortId", raw, mi.name, shortId.removePrefix(mi.name), mth.accessFlags.isStatic))
+            }
+        }
+        return out
+    }
+
+    private fun abiToArch(abi: String) = io.github.nitanmarcel.jdex.disasm.ElfArch.fromAndroidAbi(abi)
+
+    private fun patchNativeAtVaddr(base: String, vaddr: Long) {
+        if (debugSession is ArtSession) { enableNativeDebugging { patchNativeAtVaddr(base, vaddr) }; return }
+        val session = debugSession ?: return
+        val rt = session.runtimeAddr(base, vaddr) ?: run { log.warning("Patch: '$base' not mapped in the target (library loaded?)"); return }
+        val arch = nativeArch[base] ?: run { log.warning("Patch: unknown arch for $base"); return }
+        val cur = session.readMemory(rt, 16)?.let { CapstoneDisassembler.disassemble(it, rt, arch, false).firstOrNull() }
+        val curAsm = cur?.let { "${it.mnemonic} ${it.operands}".trim() } ?: ""
+        val bytes = NativePatchDialog.show(this, rt, arch, curAsm) ?: return
+        if (session.writeMemory(rt, bytes)) log.info("Patched ${bytes.size} bytes at 0x${rt.toString(16)} ($base+0x${vaddr.toString(16)}) — listing still shows on-disk code")
+        else log.warning("Patch write failed at 0x${rt.toString(16)}")
+    }
+
+    private fun viewMemoryFromOperand(operand: String) {
+        val regs = debugSession?.inlineValues() ?: return
+        fun reg(n: String): Long? = regs[n.trim().removePrefix("$")]?.removePrefix("0x")?.toULongOrNull(16)?.toLong()
+        fun regVal(n: String): Long? {
+            val name = n.trim().removePrefix("$")
+            if (name == "rip" || name == "eip" || name == "pc") return debugSession?.architecturalPc()
+            return reg(name)
+        }
+        var body = operand.trim()
+        var segBase = 0L
+        Regex("^(fs|gs|ds|es|cs|ss):", RegexOption.IGNORE_CASE).find(body)?.let { seg ->
+            body = body.substring(seg.value.length)
+            segBase = reg("${seg.groupValues[1].lowercase()}_base") ?: 0L
+        }
+        fun term(t0: String): Long? {
+            val t = t0.trim().removePrefix("#").trim()
+            if ('*' in t) { val (r, s) = t.split('*', limit = 2); return regVal(r)?.times(s.trim().toLongOrNull() ?: 1L) }
+            if ('/' in t) { val (r, s) = t.split('/', limit = 2); val d = s.trim().toLongOrNull() ?: 1L; return regVal(r)?.let { if (d == 0L) it else it / d } }
+            return regVal(t) ?: t.removePrefix("0x").toLongOrNull(16) ?: t.toLongOrNull()
+        }
+        val shifted = Regex("([a-z0-9$]+)\\s*,\\s*(lsl|asl|lsr|asr|sxt[wxbh]|uxt[wxbh])\\s*(?:#(\\d+))?", RegexOption.IGNORE_CASE)
+            .replace(body) { m ->
+                val r = m.groupValues[1]; val op = m.groupValues[2].lowercase(); val scale = 1L shl (m.groupValues[3].toIntOrNull() ?: 0)
+                if (op == "lsr" || op == "asr") "$r/$scale" else "$r*$scale"
+            }
+        val cleaned = shifted.replace(",", " + ")
+        var addr = 0L
+        var any = false
+        Regex("[+\\-]?\\s*[^+\\-]+").findAll(cleaned).forEach { m ->
+            val raw = m.value.trim()
+            val neg = raw.startsWith("-")
+            val v = term(raw.removePrefix("-").removePrefix("+")) ?: return@forEach
+            addr += if (neg) -v else v
+            any = true
+        }
+        if (!any) return
+        debugViews.memory.go(addr + segBase)
+        Docking.bringToFront(debugViews.memory)
+    }
+
+    private fun resolveMemoryAddress(input: String): Long? {
+        val t = input.trim()
+        fun num(x: String): Long? {
+            val s = x.trim()
+            return s.removePrefix("0x").removePrefix("0X").toULongOrNull(16)?.toLong() ?: s.toLongOrNull()
+        }
+        val plus = t.indexOf('+')
+        if (plus > 0) {
+            val name = t.substring(0, plus).trim()
+            val off = num(t.substring(plus + 1)) ?: return null
+            return debugSession?.modules()?.firstOrNull { it.name == name || it.name.startsWith(name) }?.let { it.base + off }
+        }
+        return num(t) ?: debugSession?.modules()?.firstOrNull { it.name == t || it.name.startsWith(t) }?.base
+    }
+
+    private fun symbolizeNative(basename: String, off: Long): String? {
+        val fns = nativeSymbols[basename] ?: return null
+        val i = fns.indexOfLast { it.address <= off }
+        if (i < 0) return null
+        val f = fns[i]
+        val within = if (f.size > 0) off < f.address + f.size
+        else fns.getOrNull(i + 1)?.let { off < it.address } ?: (off - f.address < 0x1000)
+        if (!within) return null
+        val delta = off - f.address
+        return if (delta == 0L) f.name else "${f.name}+0x${delta.toString(16)}"
+    }
+
+    private fun registerMetaFor(descriptor: String): RegisterMeta? {
+        val s = session ?: return null
+        val raw = descriptor.substringBefore("->").removePrefix("L").removeSuffix(";").replace('/', '.')
+        return s.registerMeta(raw, descriptor.substringAfter("->"))
+    }
+
+    private fun breakpointStore(): BreakpointStore = project ?: NoBreakpoints
+
+    private fun onBreakpointToggled(descriptor: String, dexPc: Int, added: Boolean) {
+        val bp = Breakpoint.Dex(descriptor, dexPc)
+        if (added) {
+            debugSession?.addBreakpoint(bp)
+            breakpointStore().addBreakpoint(descriptor, dexPc)
+        } else {
+            debugSession?.removeBreakpoint(bp)
+            breakpointStore().removeBreakpoint(descriptor, dexPc)
+        }
+        log.info(("${if (added) "Set" else "Cleared"} breakpoint at $descriptor @%04x").format(dexPc))
     }
 
     private fun showJava(className: String) {
