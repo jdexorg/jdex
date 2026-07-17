@@ -1,0 +1,7 @@
+# JVM options for jdex — one option per line. Blank lines and lines starting with # are ignored.
+#
+# Max heap: with no -Xmx line, jdex uses the JVM default.
+# Raise it for large APKs or emulation (unidbg / GraalPy scripting), e.g.:
+#   -Xmx8g
+#
+# Add any other JVM flags below, one per line.

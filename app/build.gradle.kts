@@ -9,6 +9,7 @@ plugins {
 repositories {
     mavenCentral()
     google()
+    maven { url = uri("https://jitpack.io") }
 }
 
 dependencies {
@@ -31,13 +32,21 @@ dependencies {
     implementation(libs.graalpy.regex)
     implementation(libs.jadx.core)
     implementation(libs.jadx.dex.input)
+    implementation(libs.jadx.kotlin.metadata)
     implementation(libs.jdwp)
     implementation(libs.kotlinx.coroutines.swing)
     implementation(libs.miglayout.swing)
     implementation(libs.moderndocking.single.app)
     implementation(libs.moderndocking.ui)
     implementation(libs.rsyntaxtextarea)
+    implementation(libs.java.diff.utils)
     implementation(libs.sqlite.jdbc)
+    implementation(libs.unidbg.android) {
+        exclude(group = "com.github.zhkl0228", module = "capstone")
+    }
+    implementation(libs.unidbg.unicorn2) {
+        exclude(group = "com.github.zhkl0228", module = "capstone")
+    }
 
     testImplementation(libs.junit.jupiter)
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")

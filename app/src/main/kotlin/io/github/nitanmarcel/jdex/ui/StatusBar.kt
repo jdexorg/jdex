@@ -25,6 +25,8 @@ class StatusBar : JPanel(BorderLayout()) {
     }
     private var cancelAction: (() -> Unit)? = null
     private var progressText = ""
+    private var foreground = false
+    private var backgroundText: String? = null
 
     init {
         border = BorderFactory.createCompoundBorder(
@@ -37,7 +39,7 @@ class StatusBar : JPanel(BorderLayout()) {
         add(left, BorderLayout.WEST)
         add(position.apply { horizontalAlignment = SwingConstants.RIGHT }, BorderLayout.EAST)
         muted(target); muted(arch); muted(position)
-        showProgress(false)
+        render()
         refreshVisibility()
     }
 
@@ -53,14 +55,14 @@ class StatusBar : JPanel(BorderLayout()) {
 
     fun startProgress(text: String, onCancel: () -> Unit) {
         cancelAction = onCancel
+        foreground = true
         progressText = text
-        progressLabel.text = text
         progressBar.isIndeterminate = true
-        showProgress(true)
-        revalidate(); repaint()
+        render()
     }
 
     fun setProgress(current: Int, total: Int, unit: String) {
+        if (!foreground) return
         progressBar.isIndeterminate = false
         progressBar.maximum = total
         progressBar.value = current
@@ -68,13 +70,37 @@ class StatusBar : JPanel(BorderLayout()) {
     }
 
     fun stopProgress() {
-        showProgress(false)
         cancelAction = null
-        revalidate(); repaint()
+        foreground = false
+        render()
     }
 
-    private fun showProgress(on: Boolean) {
-        progressLabel.isVisible = on; progressBar.isVisible = on; progressCancel.isVisible = on
+    fun startBackground(text: String) {
+        backgroundText = text
+        if (!foreground) render()
+    }
+
+    fun stopBackground() {
+        backgroundText = null
+        if (!foreground) render()
+    }
+
+    private fun render() {
+        when {
+            foreground -> {
+                progressLabel.text = progressText
+                progressBar.isIndeterminate = true
+                progressLabel.isVisible = true; progressBar.isVisible = true; progressCancel.isVisible = true
+            }
+            backgroundText != null -> {
+                progressText = backgroundText!!
+                progressLabel.text = progressText
+                progressBar.isIndeterminate = true
+                progressLabel.isVisible = true; progressBar.isVisible = true; progressCancel.isVisible = false
+            }
+            else -> { progressLabel.isVisible = false; progressBar.isVisible = false; progressCancel.isVisible = false }
+        }
+        revalidate(); repaint()
     }
 
     private fun refreshVisibility() {

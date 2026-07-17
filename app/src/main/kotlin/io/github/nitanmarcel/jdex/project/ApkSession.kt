@@ -12,6 +12,11 @@ import jadx.api.ResourceFile
 import jadx.api.ResourceType
 import jadx.api.metadata.annotations.InsnCodeOffset
 import jadx.api.metadata.annotations.NodeDeclareRef
+import jadx.api.plugins.input.insns.Opcode
+import jadx.core.dex.instructions.args.ArgType
+import jadx.core.dex.visitors.blocks.JdexMultiEntryFix
+import jadx.core.dex.visitors.blocks.JdexCfgSpikeCapture
+import jadx.core.dex.visitors.blocks.JdexBlockPrunePass
 import java.io.File
 import java.security.MessageDigest
 import java.security.cert.X509Certificate
@@ -27,6 +32,7 @@ class ApkSession private constructor(
     val malformedDexes: List<MalformedDex>,
     private val tempDexFiles: List<File>,
     private val input: File,
+    val config: EngineConfig = EngineConfig.DEFAULT,
 ) : AutoCloseable {
 
     private val inputIsZip by lazy { runCatching { ZipFile(input).use {} }.isSuccess }
@@ -115,9 +121,240 @@ class ApkSession private constructor(
     class Decompiled(val title: String, val code: String, val sync: CodeSync)
 
     enum class DecompileMode(val label: String, val sync: Boolean) {
-        JAVA("Java", true),
+        JDEC("JDec", true),
+        JAVA("Code", true),
         SIMPLE("Simple", true),
         FALLBACK("Fallback", false),
+    }
+
+    private val engineSource by lazy {
+        try {
+            io.github.nitanmarcel.jdex.exec.input.DexInputSource.load(input)
+        } catch (t: Throwable) {
+            java.util.logging.Logger.getLogger("jdex").log(
+                java.util.logging.Level.WARNING, "Engine load failed; all deobfuscation disabled for this input", t)
+            null
+        }
+    }
+
+    fun engineSource(): io.github.nitanmarcel.jdex.exec.MethodSource? = engineSource
+
+    private val engineCtx by lazy { engineSource?.let { io.github.nitanmarcel.jdex.exec.EngineContext(it) } }
+
+    private val stringDecryptor by lazy {
+        engineSource?.let { io.github.nitanmarcel.jdex.exec.analysis.StringDecryptor(it, ctx = engineCtx) }
+    }
+
+    private val nativeDecryptorsLazy = lazy {
+        val src = engineSource ?: return@lazy emptyList<io.github.nitanmarcel.jdex.disasm.NativeStringDecryptor>()
+        val libs = armNativeLibBytes()
+        if (libs.isEmpty()) return@lazy emptyList()
+        val bridge = io.github.nitanmarcel.jdex.disasm.VmJavaBridge(src)
+        libs.mapNotNull { runCatching { io.github.nitanmarcel.jdex.disasm.NativeStringDecryptor(it, bridge) }.getOrNull() }
+    }
+    private val nativeDecryptors get() = nativeDecryptorsLazy.value
+
+    private val classDeob = java.util.concurrent.ConcurrentHashMap<String, List<io.github.nitanmarcel.jdex.exec.analysis.InsnAnnotation>>()
+
+    fun deobStringsForClass(rawName: String): List<io.github.nitanmarcel.jdex.exec.analysis.InsnAnnotation> =
+        classDeob.getOrPut(rawName) {
+            val src = engineSource ?: return@getOrPut emptyList()
+            val sd = stringDecryptor ?: return@getOrPut emptyList()
+            val methods = src.methodsOf(descOf(rawName))
+            val dex = runCatching { sd.recoverAll(methods) }.getOrDefault(emptyList())
+            val native = nativeDecryptors.flatMap { runCatching { it.recoverCallSites(methods) }.getOrDefault(emptyList()) }
+            dex + native
+        }
+
+    private fun armNativeLibBytes(): List<ByteArray> {
+        val names = entryNames().filter { it.startsWith("lib/") && it.endsWith(".so") }
+        val abi = listOf("arm64-v8a", "armeabi-v7a").firstOrNull { a -> names.any { it.startsWith("lib/$a/") } } ?: return emptyList()
+        return names.filter { it.startsWith("lib/$abi/") }.map { readFile(it) }.filter { it.isNotEmpty() }
+    }
+
+    private val cfgAnalysis by lazy { engineSource?.let { io.github.nitanmarcel.jdex.exec.analysis.CfgAnalysis(it, ctx = engineCtx) } }
+    private val cfgFactsCache = java.util.concurrent.ConcurrentHashMap<String, java.util.Optional<io.github.nitanmarcel.jdex.exec.analysis.MethodCfgFacts>>()
+
+    private fun cfgFactsFor(rawName: String, shortId: String): io.github.nitanmarcel.jdex.exec.analysis.MethodCfgFacts? {
+        val analysis = cfgAnalysis ?: return null
+        val src = engineSource ?: return null
+        return cfgFactsCache.computeIfAbsent("$rawName#$shortId") {
+            val m = src.method("L${rawName.replace('.', '/')};", shortId)
+            java.util.Optional.ofNullable(m?.let { runCatching { analysis.analyze(it) }.getOrNull() })
+        }.orElse(null)
+    }
+
+    private val valueResolutionPass = io.github.nitanmarcel.jdex.exec.analysis.ValueResolutionPass()
+    private val returnValuePass = io.github.nitanmarcel.jdex.exec.analysis.ReturnValuePass()
+    private val reflectionPass = io.github.nitanmarcel.jdex.exec.analysis.ReflectionPass()
+    private val reflectiveDispatch by lazy { engineSource?.let { io.github.nitanmarcel.jdex.exec.analysis.ReflectiveDispatch(it) } }
+    private val valueAnnCache = java.util.concurrent.ConcurrentHashMap<String, List<io.github.nitanmarcel.jdex.exec.analysis.InsnAnnotation>>()
+
+    internal fun valueAnnotationsFor(rawName: String, shortId: String): List<io.github.nitanmarcel.jdex.exec.analysis.InsnAnnotation> {
+        val analysis = cfgAnalysis ?: return emptyList()
+        val src = engineSource ?: return emptyList()
+        return valueAnnCache.computeIfAbsent("$rawName#$shortId") {
+            val m = src.method("L${rawName.replace('.', '/')};", shortId) ?: return@computeIfAbsent emptyList()
+            val result = runCatching { analysis.result(m) }.getOrNull() ?: return@computeIfAbsent emptyList()
+            if (!result.complete) return@computeIfAbsent emptyList()
+            val out = ArrayList<io.github.nitanmarcel.jdex.exec.analysis.InsnAnnotation>()
+            for (a in valueResolutionPass.run(m, result)) {
+                if (a !is io.github.nitanmarcel.jdex.exec.analysis.InsnAnnotation || a.text.startsWith("\"")) continue
+                out += a.copy(text = "= ${a.text}")
+            }
+            for (a in returnValuePass.run(m, result)) {
+                if (a !is io.github.nitanmarcel.jdex.exec.analysis.InsnAnnotation || a.text.removePrefix("returns ").startsWith("\"")) continue
+                out += a
+            }
+            for (a in reflectionPass.run(m, result)) {
+                if (a is io.github.nitanmarcel.jdex.exec.analysis.InsnAnnotation) out += a
+            }
+            reflectiveDispatch?.let { out += runCatching { it.annotations(m, result) }.getOrDefault(emptyList()) }
+            out
+        }
+    }
+
+    internal fun valueOverlayFor(rawName: String): List<io.github.nitanmarcel.jdex.exec.analysis.InsnAnnotation> {
+        val src = engineSource ?: return emptyList()
+        return src.methodsOf("L${rawName.replace('.', '/')};").flatMap { valueAnnotationsFor(rawName, it.ref.shortId) }
+    }
+
+    private val typePinCache = java.util.concurrent.ConcurrentHashMap<String, Map<Int, ArgType>>()
+
+    private fun refArgType(v: Any?): ArgType? {
+        val desc = when (v) {
+            is io.github.nitanmarcel.jdex.exec.runtime.DvmObject -> v.type
+            is String -> "Ljava/lang/String;"
+            is io.github.nitanmarcel.jdex.exec.runtime.UnknownVal -> v.type
+            else -> null
+        } ?: return null
+        if (desc == "Ljava/lang/Object;" || !(desc.startsWith("L") || desc.startsWith("["))) return null
+        val t = runCatching { ArgType.parse(desc) }.getOrNull() ?: return null
+        return if (t.isObject || t.isArray) t else null
+    }
+
+    private fun typesFor(rawName: String, shortId: String): Map<Int, ArgType>? {
+        val analysis = cfgAnalysis ?: return null
+        val src = engineSource ?: return null
+        return typePinCache.computeIfAbsent("$rawName#$shortId") {
+            val m = src.method("L${rawName.replace('.', '/')};", shortId) ?: return@computeIfAbsent emptyMap()
+            val result = runCatching { analysis.result(m) }.getOrNull() ?: return@computeIfAbsent emptyMap()
+            if (!result.complete) return@computeIfAbsent emptyMap()
+            val out = HashMap<Int, ArgType>()
+            val insns = m.insns
+            for (i in insns.indices) {
+                val insn = insns[i]
+                if (insn.regs.isEmpty()) continue
+                val at = refArgType(result.regOut(i, insn.regs[0])) ?: continue
+                out[insn.offset] = at
+                if (insn.opcode == Opcode.MOVE_RESULT && i > 0) out[insns[i - 1].offset] = at
+            }
+            out
+        }
+    }
+
+    private val deflattenCache = java.util.concurrent.ConcurrentHashMap<String, java.util.Optional<io.github.nitanmarcel.jdex.exec.analysis.DispatchGraph>>()
+
+    private val deflattenExplorer by lazy { engineSource?.let { io.github.nitanmarcel.jdex.exec.analysis.DispatchExplorer(it) } }
+
+    private fun deflattenGraphFor(rawName: String, shortId: String): io.github.nitanmarcel.jdex.exec.analysis.DispatchGraph? {
+        val explorer = deflattenExplorer ?: return null
+        val src = engineSource ?: return null
+        return deflattenCache.computeIfAbsent("$rawName#$shortId") {
+            val m = src.method("L${rawName.replace('.', '/')};", shortId)
+            java.util.Optional.ofNullable(m?.let { runCatching { explorer.explore(it) }.getOrNull() })
+        }.orElse(null)
+    }
+
+    private val unreflect by lazy { engineSource?.let { io.github.nitanmarcel.jdex.exec.analysis.Unreflect(it) } }
+
+    private fun unreflectFor(dispatcherRaw: String, index: Int): io.github.nitanmarcel.jdex.exec.analysis.UnreflectTarget? =
+        unreflect?.let { runCatching { it.resolve("L${dispatcherRaw.replace('.', '/')};", index) }.getOrNull() }
+
+    private fun resolveDispatchFor(dispatcherRaw: String, shortId: String, index: Int): io.github.nitanmarcel.jdex.exec.analysis.DispatchTarget? =
+        reflectiveDispatch?.let { runCatching { it.resolve("L${dispatcherRaw.replace('.', '/')};", shortId, index) }.getOrNull() }
+
+    private fun resolveDispatchInvokeFor(dispatcherRaw: String, shortId: String, index: Int, argCount: Int): io.github.nitanmarcel.jdex.exec.analysis.ReflectInvokeTarget? =
+        reflectiveDispatch?.let { runCatching { it.resolveInvoke("L${dispatcherRaw.replace('.', '/')};", shortId, index, argCount) }.getOrNull() }
+
+    private fun isReflectiveFor(dispatcherRaw: String, shortId: String): Boolean =
+        reflectiveDispatch?.let { runCatching { it.isReflectiveDispatcher("L${dispatcherRaw.replace('.', '/')};", shortId) }.getOrDefault(false) } ?: false
+
+    private val reflectInvokeCache = java.util.concurrent.ConcurrentHashMap<String, Map<Int, io.github.nitanmarcel.jdex.exec.analysis.ReflectInvokeTarget>>()
+
+    private fun reflectInvokeFor(rawName: String, shortId: String, offset: Int): io.github.nitanmarcel.jdex.exec.analysis.ReflectInvokeTarget? {
+        val analysis = cfgAnalysis ?: return null
+        val src = engineSource ?: return null
+        val map = reflectInvokeCache.computeIfAbsent("$rawName#$shortId") {
+            val m = src.method("L${rawName.replace('.', '/')};", shortId) ?: return@computeIfAbsent emptyMap()
+            val result = runCatching { analysis.result(m) }.getOrNull()?.takeIf { it.complete } ?: return@computeIfAbsent emptyMap()
+            runCatching { reflectionPass.invokeTargets(m, result) }.getOrDefault(emptyMap())
+        }
+        return map[offset]
+    }
+
+    private val reflectSiteCache = java.util.concurrent.ConcurrentHashMap<String, Pair<List<io.github.nitanmarcel.jdex.exec.analysis.ReflectFieldSite>, List<io.github.nitanmarcel.jdex.exec.analysis.ReflectInvokeSite>>>()
+
+    private fun reflectSitesFor(rawName: String, shortId: String): Pair<List<io.github.nitanmarcel.jdex.exec.analysis.ReflectFieldSite>, List<io.github.nitanmarcel.jdex.exec.analysis.ReflectInvokeSite>> =
+        reflectSiteCache.computeIfAbsent("$rawName#$shortId") {
+            val rd = reflectiveDispatch ?: return@computeIfAbsent emptyList<io.github.nitanmarcel.jdex.exec.analysis.ReflectFieldSite>() to emptyList()
+            val m = engineSource?.method("L${rawName.replace('.', '/')};", shortId)
+                ?: return@computeIfAbsent emptyList<io.github.nitanmarcel.jdex.exec.analysis.ReflectFieldSite>() to emptyList()
+            runCatching { rd.fieldSites(m) }.getOrDefault(emptyList()) to runCatching { rd.invokeSites(m) }.getOrDefault(emptyList())
+        }
+
+    fun deobBytecodeOverlay(): Map<String, String> {
+        val src = engineSource ?: return emptyMap()
+        val out = HashMap<String, String>()
+        for (a in classRawNames().flatMap { deobStringsForClass(it) }) {
+            val m = src.method(a.descriptor.substringBefore("->"), a.descriptor.substringAfter("->")) ?: continue
+            out["i:%08x".format(m.codeOffset + a.offset * 2)] = a.text
+        }
+        return out
+    }
+
+    private val jdecJadx by lazy {
+        JadxDecompiler(JadxArgs().apply {
+            inputFiles.add(input)
+            setSkipResources(true)
+            setShowInconsistentCode(true)
+            renameFlags = emptySet()
+            useKotlinMethodsForVarNames = JadxArgs.UseKotlinMethodsForVarNames.APPLY_AND_HIDE
+        }).also { d ->
+            d.addCustomPass(JdecBlockLockPass())
+            if (config.enabled(EnginePass.STRING_VALUES)) d.addCustomPass(JdecValuePass(::deobStringsForClass))
+            if (config.enabled(EnginePass.UNREFLECT)) {
+                d.addCustomPass(JdecReflectPreBlock({ raw, s -> reflectSitesFor(raw, s).first }, { _, _ -> emptyList() }))
+                d.addCustomPass(JdecUnreflectPass(::unreflectFor, ::reflectInvokeFor))
+                d.addCustomPass(JdecUnreflectPass(::unreflectFor, ::reflectInvokeFor, ::resolveDispatchFor, ::resolveDispatchInvokeFor, ::isReflectiveFor, afterTypes = true))
+            }
+            if (config.cleanupEnabled) d.addCustomPass(JdecTypePinPass(::typesFor))
+            if (config.cleanupEnabled) d.addCustomPass(JdecConcatCastPass())
+            if (config.cleanupEnabled) d.addCustomPass(JdecCleanupPass(::cfgFactsFor))
+            if (config.cleanupEnabled) d.addCustomPass(JdecConstFoldPass())
+            if (config.cleanupEnabled) d.addCustomPass(JdecDeadCodePass(::cfgFactsFor))
+            if (config.enabled(EnginePass.DEFLATTEN)) d.addCustomPass(JdecDeflattenPass(::deflattenGraphFor))
+            if (config.cleanupEnabled) {
+                d.addCustomPass(JdexBlockPrunePass(::cfgFactsFor))
+                d.addCustomPass(JdexMultiEntryFix())
+                d.addCustomPass(JdexCfgSpikeCapture())
+            }
+            Thread.interrupted()
+            d.load()
+        }
+    }
+
+    private val jdecClassesByRawName by lazy { jdecJadx.classesWithInners.associateBy { it.rawName } }
+
+    fun prewarm() {
+        if (!config.emulatorEnabled) return
+        runCatching { jdecClassesByRawName }
+        if (config.decryptStringsAtStartup) {
+            runCatching { classRawNames().forEach { deobStringsForClass(it) } }
+        } else {
+            runCatching { engineCtx }
+            runCatching { nativeDecryptors.parallelStream().forEach { it.candidates() } }
+        }
     }
 
     private val appliedRenames = HashMap<String, String>()
@@ -148,17 +385,28 @@ class ApkSession private constructor(
     }
 
     fun decompile(name: String, mode: DecompileMode = DecompileMode.JAVA): Decompiled? {
+        Thread.interrupted()
         val cls = classesByRawName[name] ?: return null
         val top = cls.topParentClass
         val title = top.fullName.substringAfterLast('.')
         return runCatching {
+            val jdecCls = if (mode == DecompileMode.JDEC && config.emulatorEnabled) jdecClassesByRawName[name] else null
             val info = when (mode) {
+                DecompileMode.JDEC -> (jdecCls?.topParentClass ?: top).codeInfo
                 DecompileMode.JAVA -> if (appliedRenames.isNotEmpty()) top.reload() else top.codeInfo
                 DecompileMode.SIMPLE -> top.classNode.decompileWithMode(JadxMode.SIMPLE)
                 DecompileMode.FALLBACK -> top.classNode.decompileWithMode(JadxMode.FALLBACK)
             }
-            Decompiled(title, info.codeStr, if (mode.sync) buildSync(info) else CodeSync.EMPTY)
-        }.getOrElse { Decompiled(title, "// failed to decompile $name: ${it.message}", CodeSync.EMPTY) }
+            val code = if (jdecCls != null) JdecValueInjector.annotatedSource(jdecCls, info, valueOverlayFor(name)) else info.codeStr
+            Decompiled(title, code, if (mode.sync) buildSync(info) else CodeSync.EMPTY)
+        }.getOrElse { recoverDecompile(title, name, it) }
+    }
+
+    private fun recoverDecompile(title: String, name: String, e: Throwable): Decompiled {
+        if (e is kotlin.coroutines.cancellation.CancellationException) throw e
+        Thread.interrupted()
+        val trace = e.stackTraceToString().trimEnd().lineSequence().joinToString("\n") { " * $it" }
+        return Decompiled(title, "/*\n * jdex: failed to decompile $name\n *\n$trace\n */\n", CodeSync.EMPTY)
     }
 
     private fun buildSync(info: ICodeInfo): CodeSync {
@@ -231,12 +479,6 @@ class ApkSession private constructor(
         return runCatching { pick?.methodNode?.methodInfo?.shortId }.getOrNull()
     }
 
-    fun isNativeMethod(rawName: String, shortId: String): Boolean {
-        val cls = classesByRawName[rawName] ?: return false
-        return runCatching {
-            cls.methods.any { it.methodNode.methodInfo.shortId == shortId && it.methodNode.accessFlags.isNative }
-        }.getOrDefault(false)
-    }
 
     fun jniMethodKey(name: String, jniSignature: String): String? {
         val target = "$name$jniSignature"
@@ -418,6 +660,7 @@ class ApkSession private constructor(
 
     override fun close() {
         jadx.close()
+        if (nativeDecryptorsLazy.isInitialized()) nativeDecryptorsLazy.value.forEach { runCatching { it.close() } }
         tempDexFiles.forEach { runCatching { it.delete() } }
     }
 
@@ -426,7 +669,7 @@ class ApkSession private constructor(
         private val DEX = Regex("""classes\d*\.dex""")
         private val MAX_BYTES = 1 shl 20
 
-        fun load(input: File, projectName: String, dexStore: DexStore = NoDexStore, fileStore: FileStore = NoFileStore): ApkSession {
+        fun load(input: File, projectName: String, dexStore: DexStore = NoDexStore, fileStore: FileStore = NoFileStore, config: EngineConfig = EngineConfig.DEFAULT): ApkSession {
             val isApk = runCatching { ZipFile(input).use {} }.isSuccess
             val certificates = if (isApk) certificates(input) else emptyList()
 
@@ -440,6 +683,7 @@ class ApkSession private constructor(
                 setSkipResources(false)
                 setShowInconsistentCode(true)
                 renameFlags = emptySet()
+                useKotlinMethodsForVarNames = JadxArgs.UseKotlinMethodsForVarNames.APPLY_AND_HIDE
             })
             jadx.load()
 
@@ -501,7 +745,7 @@ class ApkSession private constructor(
             }.ifEmpty { listOf(artifact) }
             val root = ProjectNode(projectName, children = rootChildren)
 
-            return ApkSession(jadx, root, appPackage, certificates.size, manifestText, malformed, extraDexFiles, input)
+            return ApkSession(jadx, root, appPackage, certificates.size, manifestText, malformed, extraDexFiles, input, config)
         }
 
         private fun gatherDexes(input: File, isApk: Boolean, store: DexStore, extra: MutableList<File>, malformed: MutableList<MalformedDex>) {

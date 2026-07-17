@@ -98,6 +98,7 @@ class VirtualCodeView(
     fun revealSection(name: String): Boolean = source.sectionStart(name)?.let { goToLine(it); true } ?: false
 
     private val commentCache = HashMap<String, String>()
+    private var overlayComments: Map<String, String> = emptyMap()
     private val bookmarkLines = HashSet<Int>()
     private var highlight: String? = null
     private val backStack = ArrayDeque<Int>()
@@ -143,6 +144,7 @@ class VirtualCodeView(
     private var breakpointColor = Color(0xE5, 0x1C, 0x23)
     var onToggleBreakpoint: ((descriptor: String, dexPc: Int, added: Boolean) -> Unit)? = null
     var onRunToCursor: ((descriptor: String, dexPc: Int) -> Unit)? = null
+    var emulatorMode: () -> Boolean = { false }
     var onToggleNativeBreakpoint: ((vaddr: Long, added: Boolean) -> Unit)? = null
     var onRunToCursorNative: ((vaddr: Long) -> Unit)? = null
     var onViewMemoryNative: ((operand: String) -> Unit)? = null
@@ -655,7 +657,7 @@ class VirtualCodeView(
                 }
                 paintTokens(g, line, y + ascent)
                 anchorOf(raw, index)?.let { anchor ->
-                    commentCache[anchor]?.let { c ->
+                    (commentCache[anchor] ?: overlayComments[anchor])?.let { c ->
                         g.color = commentColor
                         g.drawString("    ; $c", line.length * charWidth - xOffset, y + ascent)
                     }
@@ -908,6 +910,11 @@ class VirtualCodeView(
         surface.repaint()
         repaintMargins()
         graphView?.refresh()
+    }
+
+    fun setOverlayComments(map: Map<String, String>) {
+        overlayComments = map
+        rerender()
     }
 
     private fun renameSymbol() {
@@ -1990,23 +1997,6 @@ class VirtualCodeView(
         repaintMargins()
     }
 
-    fun markNativeBreakpoints(vaddrs: Collection<Long>) {
-        nativeBreakpoints.clear(); nativeBreakpoints.addAll(vaddrs)
-        if (vaddrs.isEmpty()) { nativeBreakpointLines.clear(); repaintMargins(); return }
-        background {
-            val set = vaddrs.toHashSet()
-            val lines = HashSet<Int>()
-            var i = 0
-            while (i < source.lineCount) {
-                val batch = source.lines(i, 4096)
-                if (batch.isEmpty()) break
-                batch.forEachIndexed { k, t -> parseAsmVaddr(t.trimStart())?.let { if (it in set) lines.add(i + k) } }
-                i += batch.size
-            }
-            SwingUtilities.invokeLater { nativeBreakpointLines.clear(); nativeBreakpointLines.addAll(lines); repaintMargins() }
-        }
-    }
-
     fun nativeBreakpointSet(): Set<Long> = nativeBreakpoints.toSet()
 
     fun markBreakpoints(locations: Collection<Pair<String, Int>>) {
@@ -2033,6 +2023,13 @@ class VirtualCodeView(
     }
 
     private fun toggleBreakpoint(line: Int): Boolean {
+        if (emulatorMode()) {
+            if (isAsm) { parseAsmVaddr(rawLineText(line).trimStart())?.let { onRunToCursorNative?.invoke(it) } ?: return false; return true }
+            val descriptor = methodKeyAt(line) ?: return false
+            val dexPc = source.dexPcAt(line) ?: return false
+            onRunToCursor?.invoke(descriptor, dexPc)
+            return true
+        }
         if (isAsm) {
             val vaddr = parseAsmVaddr(rawLineText(line).trimStart()) ?: return false
             val added = nativeBreakpoints.add(vaddr).also { if (!it) nativeBreakpoints.remove(vaddr) }

@@ -162,8 +162,6 @@ class NativeSession private constructor(
 
     fun armRaw(addr: Long) { if (rawBreakpoints.add(addr)) setBp(addr) }
 
-    fun clearRaw(addr: Long) { if (rawBreakpoints.remove(addr)) clearBp(addr) }
-
     fun interruptForArming() {
         val latch = CountDownLatch(1)
         armingLatch = latch

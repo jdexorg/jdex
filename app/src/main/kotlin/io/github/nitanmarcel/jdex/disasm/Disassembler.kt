@@ -19,7 +19,5 @@ interface Disassembler {
 object Disassemblers {
     val all: List<Disassembler> = listOf(CapstoneDisassembler)
 
-    fun forId(id: String): Disassembler? = all.firstOrNull { it.id == id }
-
     fun available(arch: ElfArch): List<Disassembler> = all.filter { it.supports(arch) }
 }

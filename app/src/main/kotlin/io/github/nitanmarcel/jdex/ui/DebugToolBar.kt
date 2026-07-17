@@ -28,10 +28,15 @@ class DebugToolBar(
     private val onDetach: () -> Unit = {},
     private val onExceptionBreak: (Boolean) -> Unit = {},
     private val packageHint: () -> String? = { null },
+    private val appLabel: () -> String? = { null },
     private val log: (String) -> Unit = {},
 ) : JToolBar() {
 
     private val separator = DebugProcess(-1, "")
+    private val emuDevice = DebugDevice(EMU_SERIAL, "jdex emulator", true)
+
+    private var appReady = false
+    private var currentState: DebugState = DebugState.Detached
 
     private val deviceCombo = JComboBox<DebugDevice>().apply {
         maximumSize = Dimension(240, 26)
@@ -62,7 +67,13 @@ class DebugToolBar(
         isFloatable = false
         isOpaque = false
         border = javax.swing.BorderFactory.createEmptyBorder()
-        deviceCombo.renderer = renderer<DebugDevice> { d -> if (d.online) "${d.label} (${d.serial})" else "${d.label} (${d.serial}) — offline" }
+        deviceCombo.renderer = renderer<DebugDevice> { d ->
+            when {
+                d.serial.startsWith("jdex-") -> d.label
+                d.online -> "${d.label} (${d.serial})"
+                else -> "${d.label} (${d.serial}) — offline"
+            }
+        }
         processCombo.renderer = object : DefaultListCellRenderer() {
             override fun getListCellRendererComponent(list: JList<*>?, value: Any?, index: Int, selected: Boolean, focus: Boolean): Component {
                 if (value is DebugProcess && value.pid < 0) return JSeparator(JSeparator.HORIZONTAL)
@@ -109,13 +120,30 @@ class DebugToolBar(
 
     fun exceptionBreakEnabled(): Boolean = exceptionToggle.isSelected
 
+    fun setEmuAttached() {
+        deviceCombo.isEnabled = false
+        processCombo.isEnabled = false
+        refreshBtn.isEnabled = false
+        attachBtn.isEnabled = false
+        listOf(resumeBtn, pauseBtn, stepInBtn, stepOverBtn, stepOutBtn).forEach { it.isEnabled = false }
+        detachBtn.isEnabled = true
+        statusLabel.text = " emulator "
+    }
+
+    fun setAppReady(ready: Boolean) {
+        appReady = ready
+        setState(currentState)
+        if (ready) refreshDevices()
+    }
+
     fun setState(state: DebugState) {
+        currentState = state
         val attached = state != DebugState.Detached
         val stopped = state is DebugState.Stopped
-        deviceCombo.isEnabled = !attached
-        processCombo.isEnabled = !attached
-        refreshBtn.isEnabled = !attached
-        attachBtn.isEnabled = !attached && processCombo.selectedItem != null
+        deviceCombo.isEnabled = appReady && !attached
+        processCombo.isEnabled = appReady && !attached
+        refreshBtn.isEnabled = appReady && !attached
+        attachBtn.isEnabled = appReady && !attached && processCombo.selectedItem != null
         resumeBtn.isEnabled = stopped
         stepInBtn.isEnabled = stopped
         stepOverBtn.isEnabled = stopped
@@ -132,14 +160,15 @@ class DebugToolBar(
     fun refreshDevices() {
         refreshBtn.isEnabled = false
         Thread {
-            val list = runCatching { DeviceBridge.devices() }.getOrElse { log("Device list failed: ${it.message}"); emptyList() }
+            val devices = runCatching { DeviceBridge.devices() }.getOrElse { log("Device list failed: ${it.message}"); emptyList() }
+            val list = listOf(emuDevice) + devices
             SwingUtilities.invokeLater {
                 refreshBtn.isEnabled = true
                 if (list != comboItems(deviceCombo)) {
                     val prev = (deviceCombo.selectedItem as? DebugDevice)?.serial
                     deviceCombo.model = DefaultComboBoxModel(list.toTypedArray())
                     list.firstOrNull { it.serial == prev }?.let { deviceCombo.selectedItem = it }
-                    if (list.isEmpty()) log("No devices/emulators connected")
+                    if (devices.isEmpty()) log("No devices/emulators connected")
                 }
                 refreshProcesses(autoSelect = true)
             }
@@ -151,6 +180,12 @@ class DebugToolBar(
         if (dev == null || !dev.online) {
             processCombo.model = DefaultComboBoxModel()
             attachBtn.isEnabled = false
+            return
+        }
+        if (dev.serial == EMU_SERIAL) {
+            val proc = DebugProcess(0, appLabel()?.takeIf { it.isNotEmpty() } ?: "loaded app")
+            if (comboItems(processCombo) != listOf(proc)) processCombo.model = DefaultComboBoxModel(arrayOf(proc))
+            attachBtn.isEnabled = deviceCombo.isEnabled
             return
         }
         Thread {
@@ -189,6 +224,10 @@ class DebugToolBar(
 
     private fun control(icon: javax.swing.Icon, tip: String, action: () -> Unit) =
         JButton(icon).apply { toolTipText = tip; isEnabled = false; addActionListener { action() } }
+
+    companion object {
+        const val EMU_SERIAL = "jdex-emu"
+    }
 
     private fun <T> renderer(text: (T) -> String) = object : DefaultListCellRenderer() {
         override fun getListCellRendererComponent(

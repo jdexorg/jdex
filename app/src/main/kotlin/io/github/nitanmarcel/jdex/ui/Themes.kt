@@ -121,17 +121,12 @@ object Themes {
         private set(value) = prefs.put("theme", value)
 
     fun def(id: String): Def = all.firstOrNull { it.id == id } ?: all.first()
-    val current: Def get() = def(currentId)
 
     fun chromeColor(key: String): Color? =
         chromePrefs.get(key, "").ifEmpty { null }?.let { runCatching { Color.decode(it) }.getOrNull() }
 
     fun setChromeColor(key: String, c: Color?) =
         if (c == null) chromePrefs.remove(key) else chromePrefs.put(key, hex(c))
-
-    var accent: String?
-        get() = chromePrefs.get("@accentColor", "").ifEmpty { null }
-        set(value) = if (value.isNullOrBlank()) chromePrefs.remove("@accentColor") else chromePrefs.put("@accentColor", value)
 
     var uiFontFamily: String?
         get() = prefs.get("font.ui.family", "").ifEmpty { null }

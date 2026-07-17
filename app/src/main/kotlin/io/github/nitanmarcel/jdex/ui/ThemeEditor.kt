@@ -291,7 +291,5 @@ class ThemeEditor private constructor(owner: Window?) : JDialog(owner, "Theme Ed
                 }
             }
         """.trimIndent()
-
-        private val MONO = Font(Font.MONOSPACED, Font.PLAIN, 13)
     }
 }

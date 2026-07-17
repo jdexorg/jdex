@@ -9,7 +9,10 @@ import io.github.andrewauclair.moderndocking.app.RootDockingPanel
 import io.github.andrewauclair.moderndocking.app.WindowLayoutBuilder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.swing.Swing
 import kotlinx.coroutines.withContext
@@ -17,8 +20,15 @@ import io.github.nitanmarcel.jdex.RecentFiles
 import io.github.nitanmarcel.jdex.debug.Breakpoint
 import io.github.nitanmarcel.jdex.debug.DebugDevice
 import io.github.nitanmarcel.jdex.debug.DebugLocation
+import io.github.nitanmarcel.jdex.debug.emulationReceiver
+import io.github.nitanmarcel.jdex.debug.parseParamTypes
 import io.github.nitanmarcel.jdex.debug.DebugProcess
 import io.github.nitanmarcel.jdex.debug.DebugSession
+import io.github.nitanmarcel.jdex.debug.DebuggerBase
+import io.github.nitanmarcel.jdex.debug.EmulatorDebugger
+import io.github.nitanmarcel.jdex.debug.MixedEmulatorDebugger
+import io.github.nitanmarcel.jdex.debug.NativeEmulatorDebugger
+import io.github.nitanmarcel.jdex.disasm.VmJavaBridge
 import io.github.nitanmarcel.jdex.debug.DebugState
 import io.github.nitanmarcel.jdex.debug.DebugVar
 import io.github.nitanmarcel.jdex.debug.ArtSession
@@ -28,6 +38,8 @@ import io.github.nitanmarcel.jdex.debug.NativeDebug
 import io.github.nitanmarcel.jdex.debug.DeviceBridge
 import io.github.nitanmarcel.jdex.debug.RegisterMeta
 import io.github.nitanmarcel.jdex.project.DebugControl
+import io.github.nitanmarcel.jdex.project.EmulatorDebuggerControl
+import io.github.nitanmarcel.jdex.project.NativeEmulatorDebuggerControl
 import io.github.nitanmarcel.jdex.disasm.CapstoneDisassembler
 import io.github.nitanmarcel.jdex.disasm.JniName
 import io.github.nitanmarcel.jdex.disasm.KeystoneAssembler
@@ -62,9 +74,7 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.logging.Level
 import java.util.logging.Logger
-import java.awt.Color
 import javax.swing.ButtonGroup
-import javax.swing.JColorChooser
 import javax.swing.JFileChooser
 import javax.swing.JOptionPane
 import javax.swing.SwingUtilities
@@ -84,7 +94,7 @@ class MainWindow : JFrame("jdex") {
     private val saveItem = JMenuItem("Save")
     private val saveAsItem = JMenuItem("Save As…")
     private var projectName: String? = null
-    private val scope = CoroutineScope(Dispatchers.Swing)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Swing)
     private val openTabs = LinkedHashMap<String, EditorTab>()
     private val nativeViews = ArrayList<Triple<EditorTab, VirtualCodeView, io.github.nitanmarcel.jdex.project.LineSource>>()
     private lateinit var explorer: FilesPanel
@@ -96,6 +106,7 @@ class MainWindow : JFrame("jdex") {
     private var pseudoTab: EditorTab? = null
     private var javaModes: JavaModesView? = null
     private var javaClass: String? = null
+    private var javaScope: CoroutineScope? = null
     private var syncState = FlatTriStateCheckBox.State.UNSELECTED
     private var bytecodeTab: EditorTab? = null
     private var bytecodeView: VirtualCodeView? = null
@@ -109,12 +120,28 @@ class MainWindow : JFrame("jdex") {
     private val nativeAnalyses = HashMap<String, io.github.nitanmarcel.jdex.disasm.NativeJni.Analysis>()
     private val nativeExports = HashMap<String, Map<String, Long>>()
     private val nativeSymbols = HashMap<String, List<io.github.nitanmarcel.jdex.disasm.ElfSymbol>>()
+    private val nativeFunctionStarts = HashMap<String, LongArray>()
     private val nativeArch = HashMap<String, io.github.nitanmarcel.jdex.disasm.ElfArch>()
     private lateinit var scripting: ScriptPanel
     private lateinit var debugBar: DebugToolBar
     private val statusBar = StatusBar()
+    private var engineConfig = EngineConfigDialog.saved()
     private lateinit var debugViews: DebugViews
     @Volatile private var debugSession: DebugSession? = null
+    private var emulatorAttached = false
+    @Volatile private var emuSession: DebuggerBase? = null
+    private var emuDetaching = false
+    @Volatile private var nativeEmuSession: NativeEmulatorDebugger? = null
+    private var nativeEmuDetaching = false
+    private var activeNativeBase: String? = null
+    private val nativeBytesByBase = HashMap<String, ByteArray>()
+    private var dexToNativeBridge: io.github.nitanmarcel.jdex.disasm.DexToNativeBridge? = null
+    private val emuWorld = io.github.nitanmarcel.jdex.exec.EmuWorld()
+    private val emuControl = EmulatorDebuggerControl(
+        source = { session?.engineSource() },
+        nativeBridge = { ensureDexToNativeBridge() },
+        world = { emuWorld },
+    )
     private var attaching = false
     private var enablingNative = false
     private var attachedDevice: DebugDevice? = null
@@ -195,6 +222,7 @@ class MainWindow : JFrame("jdex") {
             override fun windowClosing(e: WindowEvent) {
                 if (!confirmDiscardChanges()) return
                 runCatching { debugSession?.detach() }
+                runCatching { nativeEmuSession?.close() }
                 runCatching { clearEditors() }
                 runCatching { AppState.persist() }
                 runCatching { scope.cancel() }
@@ -209,21 +237,22 @@ class MainWindow : JFrame("jdex") {
         Docking.initialize(this)
         debugBar = DebugToolBar(
             onAttach = { dev, proc -> attachDebugger(dev, proc) },
-            onResume = { debugSession?.resume() },
-            onPause = { debugSession?.pause() },
-            onStepInto = { debugSession?.stepInto() },
-            onStepOver = { debugSession?.stepOver() },
-            onStepOut = { debugSession?.stepOut() },
-            onDetach = { debugSession?.detach() },
+            onResume = { activeDbg()?.resume() },
+            onPause = { activeDbg()?.pause() },
+            onStepInto = { activeDbg()?.stepInto() },
+            onStepOver = { activeDbg()?.stepOver() },
+            onStepOut = { activeDbg()?.stepOut() },
+            onDetach = { detachActive() },
             onExceptionBreak = { enabled -> debugSession?.setExceptionBreak(false, enabled) },
             packageHint = { session?.appPackage },
+            appLabel = { session?.let { it.appPackage?.takeIf { p -> p.isNotEmpty() } ?: dominantPackage(it) } },
             log = { log.warning(it) },
         )
         add(RootDockingPanel(this))
         add(statusBar, java.awt.BorderLayout.SOUTH)
         debugViews = DebugViews(
             onFrameSelected = { _, location, vars -> revealDebugLocation(location); updateInlineValues(location, vars) },
-            onSetValue = { key, text -> debugSession?.setValue(key, text) ?: false },
+            onSetValue = { key, text -> activeDbg()?.setValue(key, text) ?: false },
             onOpenModule = ::openDeviceModule,
             isPointer = { debugSession?.looksLikePointer(it) ?: false },
         )
@@ -250,6 +279,15 @@ class MainWindow : JFrame("jdex") {
             onReanalyze = { SwingUtilities.invokeLater { analyze() } },
             fileImporter = { name, bytes -> SwingUtilities.invokeLater { importFile(name, bytes) } },
             debug = debugControl,
+            emu = emuControl,
+            thisEmu = io.github.nitanmarcel.jdex.project.ActiveEmuControl(activeEmu = { emuSession }, world = { emuWorld }, source = { session?.engineSource() }),
+            nativeEmu = NativeEmulatorDebuggerControl(
+                lib = { name -> session?.readFile("lib/$name")?.takeIf { it.isNotEmpty() } },
+                source = { session?.engineSource() },
+                world = { emuWorld },
+            ),
+            configOf = { engineConfig },
+            applyConfig = { cfg -> SwingUtilities.invokeLater { engineConfig = cfg; analyze() } },
             ui = object : ScriptUi {
                 override fun message(text: String, error: Boolean) = SwingUtilities.invokeLater {
                     JOptionPane.showMessageDialog(
@@ -536,6 +574,7 @@ class MainWindow : JFrame("jdex") {
         projectName = (project.input() ?: file).name
         updateDirtyUi()
         log.info(project.file?.let { "Opened project ${it.absolutePath}" } ?: "Opened ${projectName} (unsaved project)")
+        engineConfig = EngineConfigDialog.show(this)
         analyze()
     }
 
@@ -607,11 +646,13 @@ class MainWindow : JFrame("jdex") {
         clearEditors()
         explorer.clear()
         hierarchy.clear()
+        if (::debugBar.isInitialized) debugBar.setAppReady(false)
         log.info("Analyzing ${input.name}…")
         scope.launch {
-            runCatching { withContext(Dispatchers.Default) { ApkSession.load(input, project.file?.name ?: input.name, project, project) } }
+            runCatching { withContext(Dispatchers.Default) { ApkSession.load(input, project.file?.name ?: input.name, project, project, engineConfig) } }
                 .onSuccess { loaded ->
                     session = loaded
+                    debugBar.setAppReady(true)
                     explorer.show(loaded.root)
                     hierarchyClasses = loaded.topClasses()
                     hierarchyNativeView = null
@@ -619,6 +660,11 @@ class MainWindow : JFrame("jdex") {
                     val malformed = if (loaded.malformedDexes.isNotEmpty()) ", ${loaded.malformedDexes.size} malformed dex" else ""
                     log.info("Loaded ${input.name}: package=${loaded.appPackage ?: "n/a"}, certs=${loaded.certificateCount}$malformed")
                     explorer.bytecode()?.let { (id, title, load) -> openView(id, title, load) }
+                    scope.launch {
+                        statusBar.startBackground("Engine is warming up")
+                        runCatching { withContext(Dispatchers.Default) { loaded.prewarm() } }
+                        statusBar.stopBackground()
+                    }
                 }
                 .onFailure { log.log(Level.SEVERE, "Failed to analyze ${input.name}: ${it.message}") }
         }
@@ -765,8 +811,10 @@ class MainWindow : JFrame("jdex") {
         nativeExports[nbase] = elf.functions.filter { it.name.startsWith("Java_") }.associate { it.name to it.address }
         nativeSymbols[nbase] = elf.functions
         nativeArch[nbase] = choice.arch
+        nativeBytesByBase[nbase] = content.bytes
         val code = CodeContent(Syntax.ASM, x86Is32, nativeId, segments, info) { progress, cancel ->
-            io.github.nitanmarcel.jdex.disasm.NativeListing.build(elf, choice.disassembler, choice.arch, choice.littleEndian, progress, cancel, info.summary) { nativeAnalyses[nbase] = it }
+            io.github.nitanmarcel.jdex.disasm.NativeListing.build(elf, choice.disassembler, choice.arch, choice.littleEndian, progress, cancel, info.summary,
+                onAnalysis = { nativeAnalyses[nbase] = it }, onFunctions = { nativeFunctionStarts[nbase] = it })
         }
         openCode(tabId, title, code)
     }
@@ -848,6 +896,7 @@ class MainWindow : JFrame("jdex") {
                     )
                     val tab = EditorTab(tabId, title, view, source, Icons.of(if (content.syntax == Syntax.ASM) "file-binary" else "file-code"))
                     openTabs[tabId] = tab
+                    view.emulatorMode = { emulatorAttached }
                     if (content.syntax == Syntax.ASM) {
                         nativeViews.add(Triple(tab, view, source))
                         content.nativeId?.let { renames.setNativeJniBindings(it, buildJniBindings(source)) }
@@ -857,14 +906,23 @@ class MainWindow : JFrame("jdex") {
                             view.onToggleNativeBreakpoint = { vaddr, added ->
                                 val bp = Breakpoint.Native(base, vaddr)
                                 when {
+                                    nativeEmuSession != null -> if (added) nativeEmuSession?.addBreakpoint(bp) else nativeEmuSession?.removeBreakpoint(bp)
+                                    emuSession != null -> if (added) emuSession?.addBreakpoint(bp) else emuSession?.removeBreakpoint(bp)
                                     debugSession is ArtSession && added -> enableNativeDebugging()
                                     else -> if (added) debugSession?.addBreakpoint(bp) else debugSession?.removeBreakpoint(bp)
                                 }
                             }
-                            view.onRunToCursorNative = { off -> debugSession?.runToCursorNative(base, off) }
+                            view.onRunToCursorNative = { off ->
+                                when {
+                                    emulatorAttached && emuSession == null && nativeEmuSession == null -> startNativeEmulation(base, off, runToOff = off)
+                                    nativeEmuSession != null -> nativeEmuSession?.runToCursorNative(base, off)
+                                    emuSession is MixedEmulatorDebugger -> (emuSession as MixedEmulatorDebugger).runToCursorNative(base, off)
+                                    else -> debugSession?.runToCursorNative(base, off)
+                                }
+                            }
                             view.onViewMemoryNative = ::viewMemoryFromOperand
-                            view.onPatchNative = { vaddr -> patchNativeAtVaddr(base, vaddr) }
-                            view.nativePatchEnabled = { debugSession != null && KeystoneAssembler.available() }
+                            view.onPatchNative = { vaddr -> if (nativeEmuSession != null || emuSession is MixedEmulatorDebugger) patchNativeEmuAtVaddr(vaddr) else patchNativeAtVaddr(base, vaddr) }
+                            view.nativePatchEnabled = { (debugSession != null || nativeEmuSession != null || emuSession is MixedEmulatorDebugger) && KeystoneAssembler.available() }
                             view.onEnableNative = { enableNativeDebugging() }
                             view.nativeEnableVisible = { debugSession is ArtSession }
                         }
@@ -874,8 +932,12 @@ class MainWindow : JFrame("jdex") {
                         dexBytecodeTab = tab
                         dexBytecodeView = view
                         view.onToggleBreakpoint = { desc, dexPc, added -> onBreakpointToggled(desc, dexPc, added) }
-                        view.onRunToCursor = { desc, dexPc -> debugSession?.runToCursor(desc, dexPc) }
+                        view.onRunToCursor = { desc, dexPc ->
+                            if (emulatorAttached && emuSession == null && nativeEmuSession == null) startDexEmulation(desc, runToPc = dexPc)
+                            else activeDbg()?.runToCursor(desc, dexPc)
+                        }
                         view.markBreakpoints(breakpointStore().breakpoints().map { it.descriptor to it.dexPc })
+                        session?.let { s -> scope.launch { val ov = runCatching { withContext(Dispatchers.Default) { s.deobBytecodeOverlay() } }.getOrNull() ?: return@launch; view.setOverlayComments(ov) } }
                     }
                     view.syncApprox = syncState == FlatTriStateCheckBox.State.INDETERMINATE
                     dockEditorTab(tab)
@@ -897,10 +959,23 @@ class MainWindow : JFrame("jdex") {
         openTabs.clear()
         nativeViews.clear()
         nativeViewByBase.clear()
+        nativeBytesByBase.clear()
+        runCatching { dexToNativeBridge?.close() }; dexToNativeBridge = null
+        activeNativeBase = null
         nativeAnalyses.clear()
         nativeExports.clear()
         nativeSymbols.clear()
+        nativeFunctionStarts.clear()
         nativeArch.clear()
+        emuWorld.hooks.clear()
+        emuWorld.android.clear()
+        emuWorld.statics.clear()
+        val prevNativeEmu = nativeEmuSession
+        emuSession = null
+        nativeEmuSession = null
+        runCatching { emuControl.reset() }
+        runCatching { prevNativeEmu?.detach() }
+        if (emulatorAttached) exitEmulatorMode()
         bytecodeTab = null
         bytecodeView = null
         dexBytecodeTab = null
@@ -995,6 +1070,7 @@ class MainWindow : JFrame("jdex") {
         activeCodeView = view
         if (debugSession == null) view.binaryArch?.let { statusBar.setArch(it) }
         if (view.isNativeView) {
+            activeNativeBase = nativeViewByBase.entries.firstOrNull { it.value.second === view }?.key
             if (hierarchyNativeView === view) return
             hierarchyNativeView = view
             hierarchy.showNativeSymbols(view.nativeFunctions().map { (name, line) -> name to { view.goToLine(line) } })
@@ -1057,7 +1133,186 @@ class MainWindow : JFrame("jdex") {
         action(view)
     }
 
+    private fun dominantPackage(s: ApkSession): String? = s.classRawNames().asSequence()
+        .map { it.substringBeforeLast('.', "") }.filter { it.isNotEmpty() }
+        .groupingBy { it }.eachCount().maxByOrNull { it.value }?.key
+
+    private fun ensureDexToNativeBridge(): io.github.nitanmarcel.jdex.exec.NativeBridge? {
+        val src = session?.engineSource() ?: return null
+        if (dexToNativeBridge == null) {
+            val libs = armNativeLibBytesForBridge()
+            if (libs.isNotEmpty()) dexToNativeBridge = io.github.nitanmarcel.jdex.disasm.DexToNativeBridge(src, libs)
+        }
+        return dexToNativeBridge
+    }
+
+    private fun armNativeLibBytesForBridge(): List<ByteArray> {
+        val s = session ?: return emptyList()
+        val names = s.entryNames().filter { it.startsWith("lib/") && it.endsWith(".so") }
+        val abi = listOf("arm64-v8a", "armeabi-v7a").firstOrNull { a -> names.any { it.startsWith("lib/$a/") } } ?: return emptyList()
+        return names.filter { it.startsWith("lib/$abi/") }.map { s.readFile(it) }.filter { it.isNotEmpty() }
+    }
+
+    private fun activeDbg(): DebuggerBase? = debugSession ?: emuSession ?: nativeEmuSession
+
+    private fun detachActive() {
+        when {
+            debugSession != null -> debugSession?.detach()
+            emuSession != null -> { emuDetaching = true; emuSession?.detach() }
+            nativeEmuSession != null -> { nativeEmuDetaching = true; nativeEmuSession?.detach() }
+            emulatorAttached -> exitEmulatorMode()
+        }
+    }
+
+    private fun exitEmulatorMode() {
+        emulatorAttached = false
+        statusBar.setTarget(""); statusBar.setArch("")
+        debugViews.clear()
+        debugBar.setState(DebugState.Detached)
+        log.info("jdex emulator detached")
+    }
+
+    private fun startDexEmulation(descriptor: String, runToPc: Int? = null) {
+        val src = session?.engineSource()
+        val method = src?.method(descriptor.substringBefore("->"), descriptor.substringAfter("->"))
+        val args = if (parseParamTypes(descriptor).isEmpty()) emptyList() else EmulationArgsDialog.show(this, descriptor) ?: return
+        val receiver = method?.let { emulationReceiver(it, src) }
+        emuDetaching = false
+        val armBases = nativeBytesByBase.keys.filter { nativeArch[it] == io.github.nitanmarcel.jdex.disasm.ElfArch.ARM || nativeArch[it] == io.github.nitanmarcel.jdex.disasm.ElfArch.ARM64 }
+        val base = activeNativeBase?.takeIf { it in armBases } ?: armBases.firstOrNull()
+        val runMethod: (DebuggerBase) -> Unit
+        val emu: DebuggerBase
+        if (base != null && src != null && nativeBytesByBase[base] != null) {
+            val is64 = nativeArch[base] == io.github.nitanmarcel.jdex.disasm.ElfArch.ARM64
+            val others = armBases.filter { it != base }.mapNotNull { nativeBytesByBase[it] }
+            val mixed = MixedEmulatorDebugger(src, nativeBytesByBase[base]!!, is64, nativeId = base, otherSoBytes = others, world = emuWorld)
+            emu = mixed; runMethod = { mixed.runMethod(descriptor, args, receiver, pauseAtEntry = false, runTo = runToPc) }
+            statusBar.setArch("dex+${nativeArch[base]?.display}")
+        } else {
+            val dexEmu = emuControl.session() ?: run { log.warning("Emulator unavailable"); return }
+            emu = dexEmu; runMethod = { dexEmu.runMethod(descriptor, args, receiver, pauseAtEntry = false, runTo = runToPc) }
+            statusBar.setArch("dex")
+        }
+        emuSession = emu
+        emu.onStateChange { st -> SwingUtilities.invokeLater { onEmuState(st) } }
+        log.info("Emulating $descriptor…")
+        runCatching { runMethod(emu) }.onFailure { emuSession = null; log.warning("Emulate failed: ${it.message}") }
+    }
+
+    private fun emuReturnValue(): Any? = (emuSession as? EmulatorDebugger)?.returnValue()
+        ?: (emuSession as? MixedEmulatorDebugger)?.returnValue()
+
+    private fun enclosingNativeStart(base: String, vaddr: Long): Long? =
+        nativeFunctionStarts[base]?.lastOrNull { it <= vaddr }
+
+    private fun startNativeEmulation(base: String, entryVaddr: Long, runToOff: Long? = null) {
+        val bytes = nativeBytesByBase[base] ?: return
+        val arch = nativeArch[base]
+        if (arch != io.github.nitanmarcel.jdex.disasm.ElfArch.ARM && arch != io.github.nitanmarcel.jdex.disasm.ElfArch.ARM64) {
+            log.warning("Native emulation supports ARM32/ARM64 only (this lib is ${arch?.display})"); return
+        }
+        val is64 = arch == io.github.nitanmarcel.jdex.disasm.ElfArch.ARM64
+        val funcStart = enclosingNativeStart(base, entryVaddr) ?: entryVaddr
+        val label = symbolizeNative(base, funcStart) ?: "sub_${funcStart.toString(16)}"
+
+        attaching = true
+        log.info("Loading $base into the native emulator…")
+        Thread {
+            val emu = runCatching { NativeEmulatorDebugger(bytes, is64, nativeId = base, bridge = session?.engineSource()?.let { VmJavaBridge(it) }) }
+                .getOrElse { e -> SwingUtilities.invokeLater { attaching = false; log.warning("Native emulator failed: ${e.message}") }; return@Thread }
+            SwingUtilities.invokeLater {
+                attaching = false
+                nativeEmuSession = emu; nativeEmuDetaching = false
+                statusBar.setArch(arch.display)
+                emu.onStateChange { st -> SwingUtilities.invokeLater { onNativeEmuState(st) } }
+                log.info("Emulating $label — running to the clicked instruction")
+                runCatching { emu.runFunction(funcStart, emptyList(), pauseAtEntry = false, runTo = runToOff) }
+                    .onFailure { nativeEmuSession = null; log.warning("Emulate failed: ${it.message}") }
+            }
+        }.start()
+    }
+
+    private fun onNativeEmuState(state: DebugState) {
+        when (state) {
+            is DebugState.Stopped -> {
+                val s = nativeEmuSession ?: return
+                debugBar.setState(state)
+                debugViews.showStopped({ s.threads() }, { tid -> s.frames(tid) }, { tid, idx -> s.variables(tid, idx) }, { ref -> s.children(ref) }, { emptyList() })
+                revealDebugLocation(state.location)
+            }
+            DebugState.Running -> {
+                debugBar.setState(state)
+                debugViews.clear()
+                nativeViewByBase.values.forEach { it.second.clearDebugLine() }
+            }
+            DebugState.Detached -> {
+                debugViews.clear()
+                nativeViewByBase.values.forEach { it.second.clearDebugLine() }
+                val rv = nativeEmuSession?.returnValue()
+                nativeEmuSession?.let { runCatching { it.close() } }
+                nativeEmuSession = null
+                if (nativeEmuDetaching) { nativeEmuDetaching = false; exitEmulatorMode() }
+                else {
+                    debugBar.setEmuAttached(); statusBar.setArch("idle")
+                    val shown = when (rv) { null -> ""; is String -> " → returned \"$rv\""; is Long -> " → returned 0x${rv.toString(16)}"; else -> " → returned $rv" }
+                    log.info("Native emulation finished$shown — set another breakpoint to emulate again")
+                }
+            }
+        }
+    }
+
+    private fun attachEmulator() {
+        if (debugSession != null || emulatorAttached || attaching) { log.warning("Already attached; detach first"); return }
+        if (session == null) { log.warning("Load an APK/DEX first"); return }
+        emulatorAttached = true
+        emuDetaching = false; nativeEmuDetaching = false
+        attachedDevice = null; attachedProc = null
+        statusBar.setTarget("jdex emulator  ·  ${session?.appPackage ?: session?.let { dominantPackage(it) } ?: ""}")
+        statusBar.setArch("idle")
+        showDebugViews()
+        debugBar.setEmuAttached()
+        log.info("jdex emulator attached — click a bytecode line (or .so instruction) to run to it")
+    }
+
+    private fun onEmuState(state: DebugState) {
+        when (state) {
+            is DebugState.Stopped -> {
+                val s = emuSession ?: return
+                debugBar.setState(state)
+                debugViews.showStopped(
+                    { s.threads() },
+                    { threadId -> s.frames(threadId) },
+                    { threadId, idx -> s.variables(threadId, idx) },
+                    { ref -> s.children(ref) },
+                    { emptyList() },
+                )
+                revealDebugLocation(state.location)
+            }
+            DebugState.Running -> {
+                debugBar.setState(state)
+                debugViews.clear()
+                dexBytecodeView?.clearDebugLine()
+            }
+            DebugState.Detached -> {
+                if (emuSession == null) return
+                debugViews.clear()
+                dexBytecodeView?.clearDebugLine()
+                nativeViewByBase.values.forEach { it.second.clearDebugLine() }
+                val rv = emuReturnValue()
+                (emuSession as? MixedEmulatorDebugger)?.let { runCatching { it.close() } }
+                emuSession = null
+                emuControl.reset()
+                if (emuDetaching) { emuDetaching = false; exitEmulatorMode() }
+                else {
+                    debugBar.setEmuAttached(); statusBar.setArch("idle")
+                    log.info(if (rv != null) "Emulation finished, returned $rv" else "Emulation finished")
+                }
+            }
+        }
+    }
+
     private fun attachDebugger(dev: DebugDevice, proc: DebugProcess) {
+        if (dev.serial == DebugToolBar.EMU_SERIAL) { attachEmulator(); return }
         if (debugSession != null || attaching) { log.warning("Already attaching/attached; detach first"); return }
         attaching = true
         log.info("Attaching to ${proc.name} (pid ${proc.pid}) on ${dev.serial}…")
@@ -1303,6 +1558,27 @@ class MainWindow : JFrame("jdex") {
         else log.warning("Patch write failed at 0x${rt.toString(16)}")
     }
 
+    private fun patchNativeEmuAtVaddr(vaddr: Long) {
+        val native = nativeEmuSession
+        val mixed = emuSession as? MixedEmulatorDebugger
+        val base: Long; val stopped: Boolean
+        when {
+            native != null -> { base = native.moduleBase; stopped = native.state is DebugState.Stopped }
+            mixed != null -> { base = mixed.nativeModuleBase; stopped = mixed.state is DebugState.Stopped }
+            else -> return
+        }
+        if (!stopped) { log.warning("Pause the emulator at a breakpoint before patching"); return }
+        val arch = activeNativeBase?.let { nativeArch[it] } ?: return
+        val rt = base + vaddr
+        val cur = (native?.readMemory(rt, 16) ?: mixed?.readMemory(rt, 16))
+            ?.let { CapstoneDisassembler.disassemble(it, rt, arch, false).firstOrNull() }
+        val curAsm = cur?.let { "${it.mnemonic} ${it.operands}".trim() } ?: ""
+        val bytes = NativePatchDialog.show(this, rt, arch, curAsm) ?: return
+        val ok = native?.writeMemory(rt, bytes) ?: mixed?.writeMemory(rt, bytes) ?: false
+        if (ok) log.info("Native-emu patched ${bytes.size} bytes at file+0x${vaddr.toString(16)} (applies on resume)")
+        else log.warning("Native-emu patch failed")
+    }
+
     private fun viewMemoryFromOperand(operand: String) {
         val regs = debugSession?.inlineValues() ?: return
         fun reg(n: String): Long? = regs[n.trim().removePrefix("$")]?.removePrefix("0x")?.toULongOrNull(16)?.toLong()
@@ -1381,10 +1657,10 @@ class MainWindow : JFrame("jdex") {
     private fun onBreakpointToggled(descriptor: String, dexPc: Int, added: Boolean) {
         val bp = Breakpoint.Dex(descriptor, dexPc)
         if (added) {
-            debugSession?.addBreakpoint(bp)
             breakpointStore().addBreakpoint(descriptor, dexPc)
+            activeDbg()?.addBreakpoint(bp)
         } else {
-            debugSession?.removeBreakpoint(bp)
+            activeDbg()?.removeBreakpoint(bp)
             breakpointStore().removeBreakpoint(descriptor, dexPc)
         }
         log.info(("${if (added) "Set" else "Cleared"} breakpoint at $descriptor @%04x").format(dexPc))
@@ -1397,12 +1673,16 @@ class MainWindow : JFrame("jdex") {
             if (Docking.isDocked(it)) Docking.undock(it)
             Docking.deregisterDockable(it)
         }
+        javaScope?.cancel()
+        val js = CoroutineScope(scope.coroutineContext + SupervisorJob(scope.coroutineContext[Job]))
+        javaScope = js
         val view = JavaModesView(
             decompile = { mode, onResult ->
-                scope.launch {
+                js.launch {
                     val result = withContext(Dispatchers.Default) {
                         session?.let { it.syncRenames(renames.snapshot()); it.decompile(className, mode) }
                     }
+                    ensureActive()
                     onResult(result)
                 }
             },

@@ -20,5 +20,9 @@ object UiColors {
 
     fun disabled(): Color = UIManager.getColor("Label.disabledForeground") ?: UIManager.getColor("textInactiveText") ?: Color(0x99, 0x99, 0x99)
 
+    fun diffAdded(): Color = alpha(success(), 48)
+
+    fun diffRemoved(): Color = alpha(error(), 48)
+
     fun alpha(c: Color, a: Int): Color = Color(c.red, c.green, c.blue, a)
 }

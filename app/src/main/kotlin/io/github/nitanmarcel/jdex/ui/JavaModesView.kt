@@ -51,6 +51,9 @@ class JavaModesView(
                     onCaret = { target -> if (modes[tabs.selectedIndex] == mode) onCaret(target) },
                     syncInitial = syncState,
                     onSyncToggle = { state -> syncChanged(mode, state) },
+                    diffBaseline = if (mode == DecompileMode.JDEC) {
+                        { onResult -> decompile(DecompileMode.JAVA) { onResult(it?.code) } }
+                    } else null,
                 )
                 views[mode] = view
                 container.add(view, BorderLayout.CENTER)

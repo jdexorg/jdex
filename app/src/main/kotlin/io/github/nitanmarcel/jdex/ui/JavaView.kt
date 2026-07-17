@@ -20,6 +20,7 @@ import javax.swing.JButton
 import javax.swing.JLabel
 import javax.swing.JPanel
 import javax.swing.JTextField
+import javax.swing.JToggleButton
 import javax.swing.KeyStroke
 
 class JavaView(
@@ -28,12 +29,20 @@ class JavaView(
     private val onCaret: (target: SyncTarget) -> Unit = {},
     syncInitial: State = State.UNSELECTED,
     private val onSyncToggle: (State) -> Unit = {},
+    private val diffBaseline: ((onResult: (String?) -> Unit) -> Unit)? = null,
 ) : JPanel(BorderLayout()) {
 
+    private val jdecCode = code
     private val area = CodeTextArea(code, Syntax.JAVA)
     private val findBar = FindBar()
     private val syncColor get() = UiColors.alpha(UiColors.accent(), 80)
     private var highlightTag: Any? = null
+    private val diffButton = JToggleButton("Diff").apply {
+        toolTipText = "Toggle a diff against the plain-Java output (what deobfuscation changed)"
+    }
+    private var baseline: String? = null
+    private val diffTags = ArrayList<Any>()
+    private var diffOn = false
     private val syncCheck = FlatTriStateCheckBox("Sync caret", syncInitial).apply {
         toolTipText = "Off  ·  checked = exact sync  ·  filled = also snap to nearest line"
     }
@@ -44,7 +53,14 @@ class JavaView(
     init {
         add(RTextScrollPane(area), BorderLayout.CENTER)
         add(findBar, BorderLayout.SOUTH)
-        add(JPanel(FlowLayout(FlowLayout.LEFT, 4, 1)).apply { add(syncCheck) }, BorderLayout.NORTH)
+        add(JPanel(FlowLayout(FlowLayout.LEFT, 4, 1)).apply {
+            add(syncCheck)
+            if (diffBaseline != null) add(diffButton)
+        }, BorderLayout.NORTH)
+
+        diffBaseline?.let { fn ->
+            diffButton.addActionListener { if (diffButton.isSelected) enterDiff(fn) else exitDiff() }
+        }
 
         val shortcut = Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx
         area.inputMap.put(KeyStroke.getKeyStroke('F'.code, shortcut), "find")
@@ -57,7 +73,7 @@ class JavaView(
             if (!syncOn) clearHighlight()
         }
         area.addCaretListener { e ->
-            if (!syncOn) return@addCaretListener
+            if (diffOn || !syncOn) return@addCaretListener
             val javaLine = runCatching { area.getLineOfOffset(e.dot) + 1 }.getOrNull() ?: return@addCaretListener
             sync.locate(javaLine, approx)?.let { onCaret(it) }
         }
@@ -70,7 +86,7 @@ class JavaView(
     }
 
     fun followTo(target: SyncTarget) {
-        if (!syncOn) return
+        if (diffOn || !syncOn) return
         val javaLine = sync.javaLineFor(target, approx) ?: return
         val line = javaLine - 1
         if (line < 0 || line >= area.lineCount) return
@@ -82,6 +98,42 @@ class JavaView(
     private fun clearHighlight() {
         highlightTag?.let { runCatching { area.removeLineHighlight(it) } }
         highlightTag = null
+    }
+
+    private fun enterDiff(baselineFn: (onResult: (String?) -> Unit) -> Unit) {
+        baseline?.let { renderDiff(it); return }
+        diffButton.isEnabled = false
+        diffButton.text = "Diff…"
+        baselineFn { java ->
+            diffButton.isEnabled = true
+            diffButton.text = "Diff"
+            if (java == null) { diffButton.isSelected = false } else { baseline = java; renderDiff(java) }
+        }
+    }
+
+    private fun renderDiff(java: String) {
+        diffOn = true
+        clearHighlight()
+        syncCheck.isEnabled = false
+        val d = UnifiedDiff.of(java, jdecCode)
+        area.text = d.text
+        area.caretPosition = 0
+        clearDiffHighlights()
+        d.addedLines.forEach { runCatching { area.addLineHighlight(it, UiColors.diffAdded()) }.getOrNull()?.let(diffTags::add) }
+        d.removedLines.forEach { runCatching { area.addLineHighlight(it, UiColors.diffRemoved()) }.getOrNull()?.let(diffTags::add) }
+    }
+
+    private fun exitDiff() {
+        diffOn = false
+        clearDiffHighlights()
+        area.text = jdecCode
+        area.caretPosition = 0
+        syncCheck.isEnabled = true
+    }
+
+    private fun clearDiffHighlights() {
+        diffTags.forEach { runCatching { area.removeLineHighlight(it) } }
+        diffTags.clear()
     }
 
     private inner class FindBar : JPanel(BorderLayout()) {

@@ -18,6 +18,7 @@ object NativeListing {
         cancel: () -> Boolean,
         header: List<String> = emptyList(),
         onAnalysis: (NativeJni.Analysis) -> Unit = {},
+        onFunctions: (LongArray) -> Unit = {},
     ): LineSource? {
         val sections = (elf.textSections + elf.dataSections).sortedBy { it.addr }
         if (sections.isEmpty()) return null
@@ -31,6 +32,7 @@ object NativeListing {
         val jni = NativeJni.analyze(elf, disassembler, arch, littleEndian, discovered)
         onAnalysis(jni)
         val starts = (discovered.toList() + jni.envFns.keys).distinct().sorted().toLongArray()
+        onFunctions(starts)
         val names = HashMap<Long, String>(starts.size * 2)
         for (s in starts) names[s] = symbols[s]?.name ?: jni.registered[s]?.name ?: "sub_${s.toString(16)}"
         val pltNames = buildPltNames(elf, disassembler, arch, littleEndian)

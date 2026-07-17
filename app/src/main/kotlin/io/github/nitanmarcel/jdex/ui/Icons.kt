@@ -20,8 +20,6 @@ object Icons {
 
     val PACKAGE: Icon = KindIcon("symbol-namespace", TokenTypes.RESERVED_WORD, Color(0x45A29E))
     val CLASS: Icon = KindIcon("symbol-class", TokenTypes.DATA_TYPE, Color(0x59A869))
-    val INTERFACE: Icon = KindIcon("symbol-interface", TokenTypes.DATA_TYPE, Color(0x3592C4))
-    val ENUM: Icon = KindIcon("symbol-enum", TokenTypes.DATA_TYPE, Color(0xC57E3C))
     val METHOD: Icon = KindIcon("symbol-method", TokenTypes.FUNCTION, Color(0xB07CC6))
     val FIELD: Icon = KindIcon("symbol-field", TokenTypes.VARIABLE, Color(0x4F86C6))
 
