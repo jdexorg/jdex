@@ -330,6 +330,27 @@ class MainWindow : JFrame("jdex") {
             .onFailure { log.warning("Discarded incompatible saved layout") }
 
         if (Docking.isDocked(logger)) Docking.bringToFront(logger)
+
+        balanceDockWeights(editors)
+        Docking.addDockingListener { SwingUtilities.invokeLater { balanceDockWeights(editors) } }
+    }
+
+    private fun balanceDockWeights(editors: java.awt.Component) {
+        fun walk(c: java.awt.Component) {
+            if (c is javax.swing.JSplitPane) {
+                val l = c.leftComponent
+                val r = c.rightComponent
+                when {
+                    l != null && SwingUtilities.isDescendingFrom(editors, l) -> c.resizeWeight = 1.0
+                    r != null && SwingUtilities.isDescendingFrom(editors, r) -> c.resizeWeight = 0.0
+                }
+                if (l != null) walk(l)
+                if (r != null) walk(r)
+            } else if (c is java.awt.Container) {
+                for (child in c.components) walk(child)
+            }
+        }
+        walk(contentPane)
     }
 
     private fun codeItem(action: VirtualCodeView.CodeAction): JMenuItem {
