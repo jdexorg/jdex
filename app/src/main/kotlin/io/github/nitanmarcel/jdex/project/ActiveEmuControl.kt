@@ -18,8 +18,10 @@ class ActiveEmuControl(
 
     override fun run(descriptor: String, args: List<Any?>, pauseAtEntry: Boolean): Boolean = na("run")
     override fun resolve(descriptor: String, args: List<Any?>?): Map<String, Any?> = na("resolve")
-    override fun registerStub(classDesc: String, name: String, handler: (Any?, List<Any?>) -> Any?) = na("register_stub")
-    override fun registerField(classDesc: String, name: String, value: Any?) = na("register_field")
+    override fun registerStub(classDesc: String, name: String, handler: (Any?, List<Any?>) -> Any?) =
+        world().android.registerMethod(classDesc, name) { recv, args -> handler(recv, args) }
+    override fun registerField(classDesc: String, name: String, value: Any?) =
+        world().android.registerField(classDesc, name, emuArg(value))
     override fun setRegister(frameIndex: Int, reg: Int, value: Any?): Boolean = na("set_register")
     override fun runToCursor(descriptor: String, dexPc: Int) = na("run_to_cursor")
     override fun returnValue(): Any? = na("return_value")

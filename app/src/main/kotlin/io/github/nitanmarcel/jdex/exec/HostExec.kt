@@ -8,17 +8,17 @@ import io.github.nitanmarcel.jdex.exec.runtime.UnknownVal
 class HostExec(private val policy: HostBoundary, private val stubs: AndroidStubs = AndroidStubs()) {
 
     fun invokeStatic(ref: MethodRef, args: List<Any?>): Any? {
-        if (!argsUsable(args)) return UnknownVal(ref.returnType)
         val sv = stubs.callStatic(ref, args)
         if (sv !== NotHandled) return sv
+        if (!argsUsable(args)) return UnknownVal(ref.returnType)
         if (!handleable(ref)) return UnknownVal(ref.returnType)
         return reflectInvoke(ref, null, args)
     }
 
     fun invokeInstance(ref: MethodRef, receiver: Any?, args: List<Any?>): Any? {
-        if (!usable(receiver) || !argsUsable(args)) return UnknownVal(ref.returnType)
         val sv = stubs.callInstance(ref, receiver, args)
         if (sv !== NotHandled) return sv
+        if (!usable(receiver) || !argsUsable(args)) return UnknownVal(ref.returnType)
         val eff = redispatch(ref, receiver)
         if (!handleable(eff)) return UnknownVal(ref.returnType)
         return reflectInvoke(eff, receiver, args)
