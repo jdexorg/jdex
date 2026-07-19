@@ -305,16 +305,7 @@ class ScriptApi(
         else -> v
     }
 
-    private fun pyToJvm(v: Value): Any? = when {
-        v.isNull -> null
-        v.isBoolean -> v.asBoolean()
-        v.isString -> v.asString()
-        v.fitsInInt() -> v.asInt()
-        v.fitsInLong() -> v.asLong()
-        v.fitsInDouble() -> v.asDouble()
-        v.hasArrayElements() -> ByteArray(v.arraySize.toInt()) { v.getArrayElement(it.toLong()).asInt().toByte() }
-        else -> emuUnwrap(v)
-    }
+    private fun pyToJvm(v: Value): Any? = pyToEmu(v, null)
 
     fun emuNew(active: Boolean, classDesc: String, ctorSig: String?, args: List<Any?>): EmuObject? =
         emuCtl(active).newObject(classDesc, ctorSig, args)

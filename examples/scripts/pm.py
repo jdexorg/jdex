@@ -43,7 +43,7 @@ emu.register_stub("Landroid/content/pm/PackageManager;", "getApplicationInfo",  
 emu.register_stub("Landroid/content/pm/PackageManager;", "getInstallerPackageName",   get_installer_package_name)
 emu.register_stub("Landroid/content/pm/PackageManager;", "checkPermission",           check_permission)
 
-emu.register_stub("Landroid/content/pm/Signature;", "toByteArray", lambda r, a: list(SIGNATURES[0]))
+emu.register_stub("Landroid/content/pm/Signature;", "toByteArray", lambda r, a: SIGNATURES[0])
 emu.register_stub("Landroid/content/pm/Signature;", "hashCode",    lambda r, a: 0)
 
 jdex.ui.message("PackageManager implemented")
