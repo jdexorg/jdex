@@ -80,7 +80,7 @@ object SyntaxThemes {
         get() = prefs.get("font.family", "").ifEmpty { null }
         set(value) = if (value == null) prefs.remove("font.family") else prefs.put("font.family", value)
     var editorFontSize: Int
-        get() = prefs.getInt("font.size", 13)
+        get() = prefs.getInt("font.size", 12)
         set(value) = prefs.putInt("font.size", value)
 
     private val monoFamily: String by lazy {
