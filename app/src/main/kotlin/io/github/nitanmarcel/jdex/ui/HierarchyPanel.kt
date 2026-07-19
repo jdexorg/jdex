@@ -9,19 +9,32 @@ import io.github.nitanmarcel.jdex.project.HMethod
 import io.github.nitanmarcel.jdex.project.Renames
 import java.awt.BorderLayout
 import java.awt.Component
+import java.awt.Toolkit
+import java.awt.event.ActionEvent
+import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import javax.swing.AbstractAction
+import javax.swing.BorderFactory
+import javax.swing.JButton
+import javax.swing.JComponent
+import javax.swing.JLabel
 import javax.swing.JMenuItem
 import javax.swing.JOptionPane
 import javax.swing.JPanel
 import javax.swing.JPopupMenu
 import javax.swing.JScrollPane
+import javax.swing.JTextField
 import javax.swing.JTree
+import javax.swing.KeyStroke
+import javax.swing.event.DocumentEvent
+import javax.swing.event.DocumentListener
 import javax.swing.event.TreeExpansionEvent
 import javax.swing.event.TreeWillExpandListener
 import javax.swing.tree.DefaultMutableTreeNode
 import javax.swing.tree.DefaultTreeCellRenderer
 import javax.swing.tree.DefaultTreeModel
+import javax.swing.tree.TreePath
 
 class HierarchyPanel(
     private val onClass: (rawName: String) -> Unit,
@@ -36,10 +49,28 @@ class HierarchyPanel(
     private val root = DefaultMutableTreeNode()
     private val model = DefaultTreeModel(root)
     private val tree = JTree(model).apply { isRootVisible = false; showsRootHandles = true; cellRenderer = RenameRenderer() }
+    private val searchField = JTextField()
+    private val searchBar = JPanel(BorderLayout()).apply {
+        isVisible = false
+        border = BorderFactory.createEmptyBorder(2, 4, 2, 4)
+        add(JLabel("Find: "), BorderLayout.WEST)
+        add(searchField, BorderLayout.CENTER)
+        add(JButton("\u2715").apply { addActionListener { closeSearch() } }, BorderLayout.EAST)
+    }
 
     init {
         Docking.registerDockable(this)
         add(JScrollPane(tree), BorderLayout.CENTER)
+        add(searchBar, BorderLayout.SOUTH)
+        bind(this, JComponent.WHEN_ANCESTOR_OF_FOCUSED_COMPONENT,
+            KeyStroke.getKeyStroke('F'.code, Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx)) { openSearch() }
+        bind(searchField, JComponent.WHEN_FOCUSED, KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0)) { closeSearch() }
+        bind(searchField, JComponent.WHEN_FOCUSED, KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0)) { findNext() }
+        searchField.document.addDocumentListener(object : DocumentListener {
+            override fun insertUpdate(e: DocumentEvent) = findFirst()
+            override fun removeUpdate(e: DocumentEvent) = findFirst()
+            override fun changedUpdate(e: DocumentEvent) = findFirst()
+        })
 
         tree.addTreeWillExpandListener(object : TreeWillExpandListener {
             override fun treeWillExpand(e: TreeExpansionEvent) {
@@ -51,17 +82,13 @@ class HierarchyPanel(
 
             override fun treeWillCollapse(e: TreeExpansionEvent) = Unit
         })
-        tree.addTreeSelectionListener {
-            when (val obj = (tree.lastSelectedPathComponent as? DefaultMutableTreeNode)?.userObject) {
-                is HClass -> onClass(obj.rawName)
-                is HMethod -> onMethod(obj.declaringRawName, obj.shortId)
-                is HField -> onField(obj.declaringRawName, obj.name)
-                is NativeSym -> obj.go()
-            }
-        }
         tree.addMouseListener(object : MouseAdapter() {
             override fun mousePressed(e: MouseEvent) = popup(e)
             override fun mouseReleased(e: MouseEvent) = popup(e)
+            override fun mouseClicked(e: MouseEvent) {
+                if (e.clickCount != 2 || !javax.swing.SwingUtilities.isLeftMouseButton(e)) return
+                navigate((tree.getPathForLocation(e.x, e.y)?.lastPathComponent as? DefaultMutableTreeNode)?.userObject)
+            }
 
             private fun popup(e: MouseEvent) {
                 if (!e.isPopupTrigger) return
@@ -76,6 +103,76 @@ class HierarchyPanel(
                 if (menu.componentCount > 0) menu.show(tree, e.x, e.y)
             }
         })
+    }
+
+    private fun navigate(obj: Any?) {
+        when (obj) {
+            is HClass -> onClass(obj.rawName)
+            is HMethod -> onMethod(obj.declaringRawName, obj.shortId)
+            is HField -> onField(obj.declaringRawName, obj.name)
+            is NativeSym -> obj.go()
+        }
+    }
+
+    private fun bind(c: JComponent, condition: Int, key: KeyStroke, action: () -> Unit) {
+        c.getInputMap(condition).put(key, key.toString())
+        c.actionMap.put(key.toString(), object : AbstractAction() {
+            override fun actionPerformed(e: ActionEvent?) = action()
+        })
+    }
+
+    private fun openSearch() {
+        searchBar.isVisible = true
+        revalidate()
+        searchField.requestFocusInWindow()
+        searchField.selectAll()
+    }
+
+    private fun closeSearch() {
+        searchBar.isVisible = false
+        searchField.text = ""
+        revalidate()
+        tree.requestFocusInWindow()
+    }
+
+    private fun findFirst() = jumpTo(-1)
+
+    private fun findNext() {
+        val current = tree.lastSelectedPathComponent as? DefaultMutableTreeNode
+        jumpTo(current?.let { orderedNodes().indexOf(it) } ?: -1)
+    }
+
+    private fun orderedNodes(): List<DefaultMutableTreeNode> {
+        val out = ArrayList<DefaultMutableTreeNode>()
+        val e = root.preorderEnumeration()
+        while (e.hasMoreElements()) (e.nextElement() as DefaultMutableTreeNode).takeIf { it !== root }?.let { out.add(it) }
+        return out
+    }
+
+    private fun jumpTo(startIndex: Int) {
+        val q = searchField.text.trim().lowercase()
+        if (q.isEmpty()) return
+        val nodes = orderedNodes()
+        val n = nodes.size
+        if (n == 0) return
+        for (step in 0 until n) {
+            val node = nodes[(startIndex + 1 + step) % n]
+            if (searchText(node)?.lowercase()?.contains(q) == true) {
+                val path = TreePath(node.path)
+                tree.selectionPath = path
+                tree.scrollPathToVisible(path)
+                return
+            }
+        }
+    }
+
+    private fun searchText(node: DefaultMutableTreeNode): String? = when (val o = node.userObject) {
+        is PackageLabel -> o.name
+        is HClass -> o.rawName
+        is HMethod -> o.display
+        is HField -> o.display
+        is NativeSym -> o.label
+        else -> null
     }
 
     private fun renameNode(obj: Any) {
