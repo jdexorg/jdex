@@ -229,7 +229,7 @@ class ScriptApi(
     fun emuResolve(active: Boolean, descriptor: String, args: List<Any?>?): Map<String, Any?> = emuCtl(active).resolve(descriptor, args)
     fun emuRegisterField(active: Boolean, classDesc: String, name: String, value: Any?) = emuCtl(active).registerField(classDesc, name, value)
     fun emuRegisterStub(active: Boolean, classDesc: String, name: String, fn: Value) =
-        emuCtl(active).registerStub(classDesc, name) { recv, args -> pyToJvm(fn.execute(*(listOf(recv) + args).toTypedArray())) }
+        emuCtl(active).registerStub(classDesc, name) { recv, args -> pyToJvm(fn.execute(recv, args)) }
     fun emuAwaitStop(active: Boolean, timeoutMs: Long): Boolean = emuCtl(active).awaitStop(timeoutMs)
     fun emuAwaitFinished(active: Boolean, timeoutMs: Long): Boolean = emuCtl(active).awaitFinished(timeoutMs)
 
