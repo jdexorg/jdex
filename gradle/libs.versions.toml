@@ -40,6 +40,7 @@ graalpy-truffle-runtime = { module = "org.graalvm.truffle:truffle-runtime", vers
 graalpy-regex = { module = "org.graalvm.regex:regex", version.ref = "graalpy" }
 jadx-core = { module = "io.github.skylot:jadx-core", version.ref = "jadx" }
 jadx-dex-input = { module = "io.github.skylot:jadx-dex-input", version.ref = "jadx" }
+jadx-java-input = { module = "io.github.skylot:jadx-java-input", version.ref = "jadx" }
 jadx-kotlin-metadata = { module = "io.github.skylot:jadx-kotlin-metadata", version.ref = "jadx" }
 jdwp = { module = "io.github.skylot:jdwp", version.ref = "jdwp" }
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit-jupiter" }

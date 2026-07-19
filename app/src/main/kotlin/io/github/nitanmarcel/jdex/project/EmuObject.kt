@@ -1,6 +1,7 @@
 package io.github.nitanmarcel.jdex.project
 
 import io.github.nitanmarcel.jdex.exec.EmuWorld
+import io.github.nitanmarcel.jdex.exec.FrameworkStubs
 import io.github.nitanmarcel.jdex.exec.MethodSource
 import io.github.nitanmarcel.jdex.exec.constructObject
 import io.github.nitanmarcel.jdex.exec.runtime.DvmObject
@@ -42,9 +43,16 @@ class EmuObject(val obj: DvmObject, private val src: MethodSource, private val w
     fun set(name: String, value: Any?) { obj.fields[fieldKey(name)] = emuArg(value) }
 
     fun call(shortId: String, args: List<Any?>): Any? {
-        val m = src.method(type, shortId) ?: throw IllegalArgumentException("no $shortId on $type")
-        val r = worldVm(src, world).invoke(m, args.map(::emuArg), if (m.isStatic) null else obj)
-        return if (r is DvmObject) EmuObject(r, src, world) else r
+        val m = src.method(type, shortId)
+        if (m != null) {
+            val r = worldVm(src, world).invoke(m, args.map(::emuArg), if (m.isStatic) null else obj)
+            return if (r is DvmObject) EmuObject(r, src, world) else r
+        }
+        if (world.android.isFrameworkClass(type)) {
+            val r = FrameworkStubs.call(world.android, type, shortId, obj, args.map(::emuArg))
+            return if (r is DvmObject) EmuObject(r, src, world) else r
+        }
+        throw IllegalArgumentException("no $shortId on $type")
     }
 
     fun fields(): Map<String, Any?> = obj.fields.entries.associate { (k, v) -> k.substringAfterLast('.') to v }

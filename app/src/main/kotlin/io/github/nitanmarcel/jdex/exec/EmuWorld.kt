@@ -15,7 +15,16 @@ fun worldVm(src: MethodSource, world: EmuWorld, limits: ExecLimits = ExecLimits(
 fun constructObject(src: MethodSource, world: EmuWorld, classDesc: String, ctorSig: String?, args: List<Any?>): DvmObject {
     val obj = DvmObject(classDesc)
     val sig = ctorSig ?: "()V"
-    val init = src.method(classDesc, "<init>$sig") ?: throw IllegalArgumentException("no <init>$sig on $classDesc")
-    worldVm(src, world).invoke(init, args, obj)
-    return obj
+    val init = src.method(classDesc, "<init>$sig")
+    if (init != null) {
+        worldVm(src, world).invoke(init, args, obj)
+        return obj
+    }
+    if (world.android.isFrameworkClass(classDesc)) {
+        if (FrameworkStubs.method(classDesc, "<init>$sig") == null) {
+            throw IllegalArgumentException("no <init>$sig on framework class $classDesc")
+        }
+        return obj
+    }
+    throw IllegalArgumentException("no <init>$sig on $classDesc")
 }

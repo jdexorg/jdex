@@ -1,6 +1,7 @@
 package io.github.nitanmarcel.jdex.debug
 
 import io.github.nitanmarcel.jdex.exec.ExecLimits
+import io.github.nitanmarcel.jdex.exec.FrameworkStubs
 import io.github.nitanmarcel.jdex.exec.MethodSource
 import io.github.nitanmarcel.jdex.exec.StubHandler
 import io.github.nitanmarcel.jdex.exec.Vm
@@ -35,13 +36,28 @@ class EmulatorDebugger(
     init { controller.onStop = { listener?.invoke(state) } }
 
     fun runMethod(descriptor: String, args: List<Any?> = emptyList(), receiver: Any? = null, pauseAtEntry: Boolean = true, runTo: Int? = null) {
-        val m = methodOf(descriptor) ?: error("no such method: $descriptor")
+        val m = methodOf(descriptor)
+        if (m == null) {
+            if (vm.android.isFrameworkClass(descriptor.substringBefore("->"))) {
+                error("framework methods have no body to run — use resolve() or register a stub and run your own method")
+            }
+            error("no such method: $descriptor")
+        }
         controller.start(vm, m, args, receiver, pauseAtEntry, runTo)
     }
 
     fun resolve(descriptor: String, args: List<Any?>? = null): DataflowResult {
-        val m = methodOf(descriptor) ?: error("no such method: $descriptor")
-        return Dataflow(Vm(source, limits = limits, androidEnvUnknown = false)).analyze(m, args)
+        methodOf(descriptor)?.let {
+            return Dataflow(Vm(source, limits = limits, androidEnvUnknown = false)).analyze(it, args)
+        }
+        val cls = descriptor.substringBefore("->")
+        val sig = descriptor.substringAfter("->")
+        if (vm.android.isFrameworkClass(cls)) {
+            val fm = FrameworkStubs.method(cls, sig) ?: error("no framework method: $descriptor (check the signature)")
+            val ret = FrameworkStubs.call(vm.android, cls, sig, null, args ?: emptyList())
+            return DataflowResult(fm, emptyArray(), emptyArray(), ret, true, emptyMap())
+        }
+        error("no such method: $descriptor")
     }
 
     fun registerStub(classDesc: String, name: String, handler: StubHandler) = vm.android.registerMethod(classDesc, name, handler)

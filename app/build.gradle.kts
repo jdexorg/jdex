@@ -32,6 +32,7 @@ dependencies {
     implementation(libs.graalpy.regex)
     implementation(libs.jadx.core)
     implementation(libs.jadx.dex.input)
+    implementation(libs.jadx.java.input)
     implementation(libs.jadx.kotlin.metadata)
     implementation(libs.jdwp)
     implementation(libs.kotlinx.coroutines.swing)

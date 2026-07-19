@@ -26,7 +26,9 @@ import jadx.api.plugins.input.insns.InsnData
 import jadx.api.plugins.input.insns.InsnIndexType
 import jadx.api.plugins.input.insns.custom.IArrayPayload
 import jadx.api.plugins.input.insns.custom.ISwitchPayload
+import jadx.api.plugins.input.ICodeLoader
 import jadx.plugins.input.dex.DexInputPlugin
+import jadx.plugins.input.java.JavaInputPlugin
 import java.io.File
 import java.nio.file.Path
 import java.util.zip.ZipFile
@@ -59,17 +61,23 @@ class DexInputSource private constructor(
         fun load(input: File): DexInputSource {
             val (paths, cleanup) = dexPaths(input)
             try {
-                val loader = DexInputPlugin().loadFiles(paths)
-                val byShortId = HashMap<Pair<String, String>, DexMethod>()
-                val classes = HashMap<String, ClassInfo>()
-                val byClass = HashMap<String, List<DexMethod>>()
-                val nativeMethods = HashSet<Pair<String, String>>()
-                loader.visitClasses { cd -> readClass(cd, byShortId, classes, byClass, nativeMethods) }
-                loader.close()
-                return DexInputSource(byShortId, classes, byClass, nativeMethods)
+                return fromLoader(DexInputPlugin().loadFiles(paths), signaturesOnly = false)
             } finally {
                 cleanup()
             }
+        }
+
+        fun loadFramework(jar: File): DexInputSource =
+            fromLoader(JavaInputPlugin.loadClassFiles(listOf(jar.toPath())), signaturesOnly = true)
+
+        private fun fromLoader(loader: ICodeLoader, signaturesOnly: Boolean): DexInputSource {
+            val byShortId = HashMap<Pair<String, String>, DexMethod>()
+            val classes = HashMap<String, ClassInfo>()
+            val byClass = HashMap<String, List<DexMethod>>()
+            val nativeMethods = HashSet<Pair<String, String>>()
+            loader.visitClasses { cd -> readClass(cd, byShortId, classes, byClass, nativeMethods, signaturesOnly) }
+            loader.close()
+            return DexInputSource(byShortId, classes, byClass, nativeMethods)
         }
 
         private fun readClass(
@@ -78,6 +86,7 @@ class DexInputSource private constructor(
             classes: MutableMap<String, ClassInfo>,
             byClass: MutableMap<String, List<DexMethod>>,
             nativeMethods: MutableSet<Pair<String, String>>,
+            signaturesOnly: Boolean,
         ) {
             val type = cd.type
             val staticInits = HashMap<String, Any?>()
@@ -90,11 +99,21 @@ class DexInputSource private constructor(
                         io.github.nitanmarcel.jdex.exec.model.FieldRef(type, fd.name, fd.type), (fd.accessFlags and ACC_STATIC) != 0)
                 },
                 seq<IMethodData> { md ->
-                    val m = decodeMethod(type, md)
-                    if (m != null) { methods += m; byShortId[type to m.ref.shortId] = m }
-                    else if ((md.accessFlags and ACC_NATIVE) != 0) {
+                    if (signaturesOnly) {
                         val mref = md.methodRef.apply { load() }
-                        nativeMethods.add(type to "${mref.name}(${mref.argTypes.joinToString("")})${mref.returnType}")
+                        val ref = MethodRef(type, mref.name, mref.argTypes, mref.returnType)
+                        val isStatic = (md.accessFlags and ACC_STATIC) != 0
+                        val paramWords = (if (isStatic) 0 else 1) + ref.argTypes.sumOf { if (it == "J" || it == "D") 2 else 1 }
+                        val m = DexMethod(type, ref, isStatic, paramWords, paramWords, emptyList(), emptyMap(), emptyList(), 0)
+                        methods += m
+                        byShortId[type to ref.shortId] = m
+                    } else {
+                        val m = decodeMethod(type, md)
+                        if (m != null) { methods += m; byShortId[type to m.ref.shortId] = m }
+                        else if ((md.accessFlags and ACC_NATIVE) != 0) {
+                            val mref = md.methodRef.apply { load() }
+                            nativeMethods.add(type to "${mref.name}(${mref.argTypes.joinToString("")})${mref.returnType}")
+                        }
                     }
                 },
             )
