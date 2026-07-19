@@ -476,7 +476,9 @@ class VirtualCodeView(
             t.startsWith(".method") -> methodIdAt(index)?.let { SyncTarget.MethodDecl(it) }
             t.startsWith(".field") -> SyncTarget.FieldDecl(section, fieldNameOf(t))
             else -> methodIdAt(index)?.let { mid ->
-                sourceLineAt(index)?.let { SyncTarget.Line(mid, it) } ?: if (syncApprox) SyncTarget.MethodDecl(mid) else null
+                source.dexPcAt(index)?.let { SyncTarget.Insn(mid, it) }
+                    ?: sourceLineAt(index)?.let { SyncTarget.Line(mid, it) }
+                    ?: if (syncApprox) SyncTarget.MethodDecl(mid) else null
             }
         }
     }
@@ -517,6 +519,32 @@ class VirtualCodeView(
                 findInMethod(target.methodId.substringBefore('#'), target.methodId.substringAfter('#'), header = false) {
                     it == ".line ${target.sourceLine}"
                 }
+            is SyncTarget.Insn ->
+                findInMethodByDexPc(target.methodId.substringBefore('#'), target.methodId.substringAfter('#'), target.dexPc)
+        }
+    }
+
+    private fun findInMethodByDexPc(rawName: String, shortId: String, dexPc: Int) {
+        val start = source.sectionStart(rawName) ?: return
+        background {
+            var line = start
+            var inMethod = false
+            var methodLine: Int? = null
+            var found: Int? = null
+            while (line < source.lineCount) {
+                val text = source.lines(line, 1).firstOrNull() ?: break
+                val t = text.trimStart()
+                if (line > start && t.startsWith("Class:")) break
+                if (t.startsWith(".method")) {
+                    inMethod = t.substringAfterLast(' ') == shortId
+                    if (inMethod) methodLine = line
+                } else if (inMethod) {
+                    if (t == ".end method") break
+                    if (source.dexPcAt(line) == dexPc) { found = line; break }
+                }
+                line++
+            }
+            SwingUtilities.invokeLater { showSyncHighlight(found ?: methodLine ?: start) }
         }
     }
 
@@ -1668,7 +1696,7 @@ class VirtualCodeView(
             override val renames get() = this@VirtualCodeView.renames
             override val comments get() = this@VirtualCodeView.comments
             override fun goToDefinition(symbol: Symbol) = this@VirtualCodeView.goToDefinition(symbol)
-            override fun findUsages(symbol: Symbol) = this@VirtualCodeView.findUsages(symbol)
+            override fun findUsages(symbol: Symbol) = this@VirtualCodeView.findUsages(symbol, ::revealUsage)
             override fun rename(symbol: Symbol) = this@VirtualCodeView.renameSymbol(symbol)
             override fun openResource(type: String, name: String) = onResource(type, name)
             override fun decompile(rawName: String) = onDecompile(rawName)
@@ -1815,7 +1843,18 @@ class VirtualCodeView(
     }
 
     private fun findUsages() {
-        if (isAsm) findUsagesAsm() else symbolAtCaret()?.let { findUsages(it) }
+        if (isAsm) findUsagesAsm() else symbolAtCaret()?.let { findUsages(it, ::revealUsage) }
+    }
+
+    fun showUsagesFor(symbol: Symbol, onActivate: (io.github.nitanmarcel.jdex.project.Usage) -> Unit) = findUsages(symbol, onActivate)
+
+    private fun revealUsage(u: io.github.nitanmarcel.jdex.project.Usage) {
+        when {
+            u.shortId != null && u.dexPc != null -> revealDexLocation(u.rawName, u.shortId, u.dexPc)
+            u.shortId != null -> revealMethod(u.rawName, u.shortId)
+            u.fieldName != null -> revealField(u.rawName, u.fieldName)
+            else -> revealClass(u.rawName)
+        }
     }
 
     private fun findUsagesAsm() {
@@ -1832,11 +1871,11 @@ class VirtualCodeView(
         }
     }
 
-    private fun findUsages(symbol: Symbol) {
+    private fun findUsages(symbol: Symbol, onActivate: (io.github.nitanmarcel.jdex.project.Usage) -> Unit) {
         background {
             val semantic = onUsages(symbol)
             if (semantic != null) {
-                SwingUtilities.invokeLater { showSemanticUsages(symbol.text, semantic) }
+                SwingUtilities.invokeLater { showSemanticUsages(symbol.text, semantic, onActivate) }
             } else {
                 val hits = source.findFrom(symbol.text, 0, 2000, false)
                 val entries = hits.map { line -> line to (source.lines(line, 1).firstOrNull()?.trim() ?: "") }
@@ -1845,7 +1884,7 @@ class VirtualCodeView(
         }
     }
 
-    private fun showSemanticUsages(query: String, usages: List<io.github.nitanmarcel.jdex.project.Usage>) {
+    private fun showSemanticUsages(query: String, usages: List<io.github.nitanmarcel.jdex.project.Usage>, onActivate: (io.github.nitanmarcel.jdex.project.Usage) -> Unit) {
         if (usages.isEmpty()) {
             JOptionPane.showMessageDialog(this, "No usages found for:\n$query", "Find Usages", JOptionPane.INFORMATION_MESSAGE)
             return
@@ -1856,12 +1895,7 @@ class VirtualCodeView(
         list.addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
                 if (e.clickCount == 2 && list.selectedIndex >= 0) {
-                    val u = usages[list.selectedIndex]
-                    when {
-                        u.shortId != null -> revealMethod(u.rawName, u.shortId)
-                        u.fieldName != null -> revealField(u.rawName, u.fieldName)
-                        else -> revealClass(u.rawName)
-                    }
+                    onActivate(usages[list.selectedIndex])
                     dialog.dispose()
                 }
             }

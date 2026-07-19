@@ -2,7 +2,7 @@ package io.github.nitanmarcel.jdex.project
 
 enum class SymbolKind { TYPE, METHOD, FIELD, STRING, RESOURCE, LOCAL }
 
-class Usage(val display: String, val rawName: String, val shortId: String?, val fieldName: String?)
+class Usage(val display: String, val rawName: String, val shortId: String?, val fieldName: String?, val dexPc: Int? = null)
 
 data class Symbol(val kind: SymbolKind, val text: String) {
 

@@ -355,13 +355,19 @@ class MainWindow : JFrame("jdex") {
 
     private fun codeItem(action: VirtualCodeView.CodeAction): JMenuItem {
         val item = JMenuItem(action.label)
-        item.addActionListener { activeCodeView?.takeIf { it.isShowing }?.perform(action) }
+        item.addActionListener { currentCodeView()?.perform(action) }
         codeActionItems.add(item to action)
         return item
     }
 
+    private fun currentCodeView(): VirtualCodeView? {
+        activeCodeView?.let { if (it.isShowing) return it }
+        return (sequenceOf(bytecodeView, dexBytecodeView) + nativeViews.asSequence().map { it.second })
+            .filterNotNull().firstOrNull { it.isShowing }
+    }
+
     private fun refreshCodeActions() {
-        val v = activeCodeView?.takeIf { it.isShowing }
+        val v = currentCodeView()
         codeActionItems.forEach { (item, action) ->
             item.isVisible = v == null || v.applies(action)
             item.isEnabled = v != null && v.canDo(action)
@@ -448,7 +454,7 @@ class MainWindow : JFrame("jdex") {
             add(subviews)
             onOpen {
                 refreshCodeActions()
-                val v = activeCodeView?.takeIf { it.isShowing }
+                val v = currentCodeView()
                 subviews.isVisible = v == null || v.applies(VirtualCodeView.CodeAction.SEGMENTS)
             }
         })
@@ -465,7 +471,7 @@ class MainWindow : JFrame("jdex") {
             add(JMenuItem("Debugger Settings…").apply { addActionListener { DebugConfigDialog.show(this@MainWindow, "", true) } })
             onOpen {
                 refreshCodeActions()
-                val v = activeCodeView?.takeIf { it.isShowing }
+                val v = currentCodeView()
                 bpSep.isVisible = v == null || v.applies(VirtualCodeView.CodeAction.BREAKPOINTS)
             }
         })
@@ -1139,6 +1145,30 @@ class MainWindow : JFrame("jdex") {
         }
     }
 
+    private fun revealInJava(rawName: String, target: SyncTarget) {
+        if (javaClass != rawName) showJava(rawName)
+        javaModes?.revealTo(target)
+    }
+
+    private fun defTarget(symbol: io.github.nitanmarcel.jdex.project.Symbol): SyncTarget? {
+        val raw = symbol.declaringClassName() ?: return null
+        return when (symbol.kind) {
+            io.github.nitanmarcel.jdex.project.SymbolKind.TYPE -> SyncTarget.ClassDecl(raw)
+            io.github.nitanmarcel.jdex.project.SymbolKind.METHOD -> symbol.member?.let { SyncTarget.MethodDecl("$raw#$it") }
+            io.github.nitanmarcel.jdex.project.SymbolKind.FIELD -> symbol.member?.substringBefore(':')?.let { SyncTarget.FieldDecl(raw, it) }
+            else -> null
+        }
+    }
+
+    private fun revealUsageInJava(u: io.github.nitanmarcel.jdex.project.Usage) {
+        val target = when {
+            u.shortId != null && u.dexPc != null -> SyncTarget.Insn("${u.rawName}#${u.shortId}", u.dexPc)
+            u.shortId != null -> SyncTarget.MethodDecl("${u.rawName}#${u.shortId}")
+            else -> SyncTarget.ClassDecl(u.rawName)
+        }
+        revealInJava(u.rawName, target)
+    }
+
     private fun dockEditorTab(tab: EditorTab) {
         val leader = (sequenceOf(dexBytecodeTab) + nativeViews.asSequence().map { it.first } + openTabs.values.asSequence())
             .filterNotNull()
@@ -1459,6 +1489,7 @@ class MainWindow : JFrame("jdex") {
 
     private fun describeTarget(t: SyncTarget): String = when (t) {
         is SyncTarget.Line -> "${methodLabel(t.methodId)}  ·  line ${t.sourceLine}"
+        is SyncTarget.Insn -> "${methodLabel(t.methodId)}  ·  0x${t.dexPc.toString(16)}"
         is SyncTarget.MethodDecl -> methodLabel(t.methodId)
         is SyncTarget.ClassDecl -> t.rawName.substringAfterLast('.').substringAfterLast('/')
         is SyncTarget.FieldDecl -> "${t.rawName.substringAfterLast('.').substringAfterLast('/')}  ·  ${t.fieldName}"
@@ -1714,6 +1745,12 @@ class MainWindow : JFrame("jdex") {
                 bytecodeView?.syncApprox = state == FlatTriStateCheckBox.State.INDETERMINATE
                 if (state == FlatTriStateCheckBox.State.UNSELECTED) bytecodeView?.clearSyncHighlight()
             },
+            onDefinition = { symbol ->
+                val raw = symbol.declaringClassName()
+                val target = defTarget(symbol)
+                if (raw != null && target != null) revealInJava(raw, target)
+            },
+            onFindUsages = { symbol -> bytecodeView?.showUsagesFor(symbol) { u -> revealUsageInJava(u) } },
         )
         val tab = EditorTab("decompiled", className.substringAfterLast('.'), view, icon = Icons.of("file-code"))
         javaTab = tab

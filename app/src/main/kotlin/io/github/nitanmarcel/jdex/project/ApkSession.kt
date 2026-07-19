@@ -8,6 +8,7 @@ import jadx.api.JadxDecompiler
 import jadx.api.JavaClass
 import jadx.api.JavaField
 import jadx.api.JavaMethod
+import jadx.api.utils.CodeUtils
 import jadx.api.ResourceFile
 import jadx.api.ResourceType
 import jadx.api.metadata.annotations.InsnCodeOffset
@@ -92,7 +93,25 @@ class ApkSession private constructor(
 
     fun usages(symbol: Symbol): List<Usage>? {
         val node = resolveNode(symbol) ?: return null
-        return runCatching { node.useIn.mapNotNull(::usageOf) }.getOrDefault(emptyList())
+        return runCatching {
+            val out = ArrayList<Usage>()
+            for (uc in node.useIn.mapNotNull { runCatching { it.topParentClass }.getOrNull() }.distinct()) {
+                val codeInfo = uc.codeInfo
+                val positions = runCatching { uc.getUsePlacesFor(codeInfo, node) }.getOrNull()?.takeIf { it.isNotEmpty() } ?: continue
+                val code = codeInfo.codeStr
+                val offsets = offsetAnnotations(codeInfo)
+                val simple = uc.rawName.substringAfterLast('.').substringAfterLast('/')
+                for (pos in positions) {
+                    val line = CodeUtils.getLineForPos(code, pos).trim()
+                    if (line.startsWith("import ")) continue
+                    val enclosing = runCatching { jadx.getEnclosingNode(codeInfo, pos) }.getOrNull() as? JavaMethod
+                    val shortId = enclosing?.let { runCatching { it.methodNode.methodInfo.shortId }.getOrNull() }
+                    val where = if (enclosing != null) "$simple.${enclosing.name}" else simple
+                    out.add(Usage("$where  ·  $line", uc.rawName, shortId, null, offsetFloor(offsets, pos)))
+                }
+            }
+            out
+        }.getOrDefault(emptyList())
     }
 
     private fun resolveNode(symbol: Symbol): jadx.api.JavaNode? {
@@ -106,19 +125,21 @@ class ApkSession private constructor(
         }
     }
 
-    private fun usageOf(node: jadx.api.JavaNode): Usage? = when (node) {
-        is jadx.api.JavaMethod -> node.declaringClass?.let {
-            val shortId = runCatching { node.methodNode.methodInfo.shortId }.getOrNull()
-            Usage("${it.rawName.substringAfterLast('.')}.${node.name}", it.rawName, shortId, null)
-        }
-        is jadx.api.JavaField -> node.declaringClass?.let {
-            Usage("${it.rawName.substringAfterLast('.')}.${node.name}", it.rawName, null, node.name)
-        }
-        is jadx.api.JavaClass -> Usage(node.rawName, node.rawName, null, null)
-        else -> null
+    private fun offsetAnnotations(codeInfo: ICodeInfo): List<Pair<Int, Int>> {
+        if (!codeInfo.hasMetadata()) return emptyList()
+        return codeInfo.codeMetadata.asMap.mapNotNull { (p, ann) -> (ann as? InsnCodeOffset)?.let { p to it.offset } }.sortedBy { it.first }
     }
 
-    class Decompiled(val title: String, val code: String, val sync: CodeSync)
+    private fun offsetFloor(offsets: List<Pair<Int, Int>>, pos: Int): Int? {
+        var lo = 0; var hi = offsets.size - 1; var ans: Int? = null
+        while (lo <= hi) {
+            val m = (lo + hi) ushr 1
+            if (offsets[m].first <= pos) { ans = offsets[m].second; lo = m + 1 } else hi = m - 1
+        }
+        return ans
+    }
+
+    class Decompiled(val title: String, val code: String, val sync: CodeSync, val nav: CodeNav = CodeNav.EMPTY)
 
     enum class DecompileMode(val label: String, val sync: Boolean) {
         JDEC("JDec", true),
@@ -398,7 +419,7 @@ class ApkSession private constructor(
                 DecompileMode.FALLBACK -> top.classNode.decompileWithMode(JadxMode.FALLBACK)
             }
             val code = if (jdecCls != null) JdecValueInjector.annotatedSource(jdecCls, info, valueOverlayFor(name)) else info.codeStr
-            Decompiled(title, code, if (mode.sync) buildSync(info) else CodeSync.EMPTY)
+            Decompiled(title, code, if (mode.sync) buildSync(info) else CodeSync.EMPTY, buildNav(info))
         }.getOrElse { recoverDecompile(title, name, it) }
     }
 
@@ -446,7 +467,17 @@ class ApkSession private constructor(
                 else -> {}
             }
         }
-        return CodeSync(targets, srcToJava, classDecl, methodDecl, fieldDecl)
+        val insnByLine = TreeMap<Int, SyncTarget.Insn>()
+        val insnToJava = HashMap<String, TreeMap<Int, Int>>()
+        for ((pos, annotation) in md.asMap) {
+            val offset = (annotation as? InsnCodeOffset)?.offset ?: continue
+            val method = jadx.getJavaNodeByRef(md.getNodeAt(pos) ?: continue) as? JavaMethod ?: continue
+            val mid = methodId(method) ?: continue
+            val line = lineOf(pos)
+            insnByLine.putIfAbsent(line, SyncTarget.Insn(mid, offset))
+            insnToJava.getOrPut(mid) { TreeMap() }.putIfAbsent(offset, line)
+        }
+        return CodeSync(targets, srcToJava, classDecl, methodDecl, fieldDecl, insnByLine, insnToJava)
     }
 
     private fun lineStarts(code: String): IntArray {
@@ -458,6 +489,37 @@ class ApkSession private constructor(
     private fun methodId(method: JavaMethod): String? {
         val shortId = runCatching { method.methodNode.methodInfo.shortId }.getOrNull() ?: return null
         return "${method.declaringClass.rawName}#$shortId"
+    }
+
+    private fun buildNav(info: ICodeInfo): CodeNav {
+        if (!info.hasMetadata()) return CodeNav.EMPTY
+        val code = info.codeStr
+        val lineStarts = lineStarts(code)
+        fun lineOf(pos: Int): Int {
+            var lo = 0; var hi = lineStarts.size - 1; var ans = 0
+            while (lo <= hi) { val m = (lo + hi) ushr 1; if (lineStarts[m] <= pos) { ans = m; lo = m + 1 } else hi = m - 1 }
+            return ans + 1
+        }
+        val byLine = HashMap<Int, TreeMap<Int, CodeNav.Entry>>()
+        for ((pos, annotation) in info.codeMetadata.asMap) {
+            val symbol = symbolOf(runCatching { jadx.getJavaNodeByCodeAnnotation(info, annotation) }.getOrNull() ?: continue) ?: continue
+            val line = lineOf(pos)
+            val col = pos - lineStarts[line - 1]
+            var end = pos
+            while (end < code.length && Character.isJavaIdentifierPart(code[end])) end++
+            byLine.getOrPut(line) { TreeMap() }[col] = CodeNav.Entry(col + (end - pos).coerceAtLeast(1), symbol)
+        }
+        return CodeNav(byLine)
+    }
+
+    private fun symbolOf(node: jadx.api.JavaNode): Symbol? = when (node) {
+        is JavaClass -> Symbol(SymbolKind.TYPE, "L${node.rawName.replace('.', '/')};")
+        is JavaMethod -> node.declaringClass?.let { cls ->
+            val shortId = runCatching { node.methodNode.methodInfo.shortId }.getOrNull() ?: return@let null
+            Symbol(SymbolKind.METHOD, "L${cls.rawName.replace('.', '/')};->$shortId")
+        }
+        is JavaField -> node.declaringClass?.let { cls -> Symbol(SymbolKind.FIELD, "L${cls.rawName.replace('.', '/')};->${node.name}") }
+        else -> null
     }
 
     fun decompiler(): JadxDecompiler = jadx

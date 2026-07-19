@@ -2,7 +2,9 @@ package io.github.nitanmarcel.jdex.ui
 
 import com.formdev.flatlaf.extras.components.FlatTriStateCheckBox
 import com.formdev.flatlaf.extras.components.FlatTriStateCheckBox.State
+import io.github.nitanmarcel.jdex.project.CodeNav
 import io.github.nitanmarcel.jdex.project.CodeSync
+import io.github.nitanmarcel.jdex.project.Symbol
 import io.github.nitanmarcel.jdex.project.SyncTarget
 import io.github.nitanmarcel.jdex.project.Syntax
 import org.fife.ui.rtextarea.SearchContext
@@ -14,11 +16,15 @@ import java.awt.FlowLayout
 import java.awt.Toolkit
 import java.awt.event.ActionEvent
 import java.awt.event.KeyEvent
+import java.awt.event.MouseAdapter
+import java.awt.event.MouseEvent
 import javax.swing.AbstractAction
 import javax.swing.BorderFactory
 import javax.swing.JButton
 import javax.swing.JLabel
+import javax.swing.JMenuItem
 import javax.swing.JPanel
+import javax.swing.JPopupMenu
 import javax.swing.JTextField
 import javax.swing.JToggleButton
 import javax.swing.KeyStroke
@@ -30,6 +36,9 @@ class JavaView(
     syncInitial: State = State.UNSELECTED,
     private val onSyncToggle: (State) -> Unit = {},
     private val diffBaseline: ((onResult: (String?) -> Unit) -> Unit)? = null,
+    private val nav: CodeNav = CodeNav.EMPTY,
+    private val onDefinition: (Symbol) -> Unit = {},
+    private val onFindUsages: (Symbol) -> Unit = {},
 ) : JPanel(BorderLayout()) {
 
     private val jdecCode = code
@@ -77,6 +86,44 @@ class JavaView(
             val javaLine = runCatching { area.getLineOfOffset(e.dot) + 1 }.getOrNull() ?: return@addCaretListener
             sync.locate(javaLine, approx)?.let { onCaret(it) }
         }
+
+        area.popupMenu = null
+        area.inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "jdexGotoDef")
+        area.actionMap.put("jdexGotoDef", object : AbstractAction() {
+            override fun actionPerformed(e: ActionEvent?) { symbolAt(area.caretPosition)?.let(onDefinition) }
+        })
+        area.inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_X, 0), "jdexFindUsages")
+        area.actionMap.put("jdexFindUsages", object : AbstractAction() {
+            override fun actionPerformed(e: ActionEvent?) { symbolAt(area.caretPosition)?.let(onFindUsages) }
+        })
+        area.addMouseListener(object : MouseAdapter() {
+            override fun mousePressed(e: MouseEvent) { if (e.isPopupTrigger) showMenu(e) }
+            override fun mouseReleased(e: MouseEvent) { if (e.isPopupTrigger) showMenu(e) }
+            override fun mouseClicked(e: MouseEvent) {
+                if (e.button == MouseEvent.BUTTON1 && (e.clickCount == 2 || e.modifiersEx and shortcut != 0)) {
+                    offsetAt(e)?.let { symbolAt(it) }?.let(onDefinition)
+                }
+            }
+        })
+    }
+
+    private fun offsetAt(e: MouseEvent): Int? = runCatching { area.viewToModel2D(e.point) }.getOrNull()?.takeIf { it >= 0 }
+
+    private fun symbolAt(offset: Int): Symbol? {
+        if (diffOn) return null
+        val line = runCatching { area.getLineOfOffset(offset) }.getOrNull() ?: return null
+        return nav.symbolAt(line + 1, offset - area.getLineStartOffset(line))
+    }
+
+    private fun showMenu(e: MouseEvent) {
+        val symbol = offsetAt(e)?.let { symbolAt(it) }
+        JPopupMenu().apply {
+            add(JMenuItem("Go to Definition").apply { isEnabled = symbol != null; addActionListener { symbol?.let(onDefinition) } })
+            add(JMenuItem("Find Usages").apply { isEnabled = symbol != null; addActionListener { symbol?.let(onFindUsages) } })
+            addSeparator()
+            add(JMenuItem("Copy").apply { isEnabled = area.selectedText != null; addActionListener { area.copy() } })
+            add(JMenuItem("Select All").apply { addActionListener { area.selectAll() } })
+        }.show(area, e.x, e.y)
     }
 
     fun setSyncState(state: State) {
@@ -93,6 +140,20 @@ class JavaView(
         clearHighlight()
         highlightTag = runCatching { area.addLineHighlight(line, syncColor) }.getOrNull()
         runCatching { area.modelToView(area.getLineStartOffset(line))?.let { area.scrollRectToVisible(it) } }
+    }
+
+    fun revealTo(target: SyncTarget) {
+        if (diffOn) return
+        val javaLine = sync.javaLineFor(target, true) ?: return
+        val line = (javaLine - 1).coerceIn(0, area.lineCount - 1)
+        clearHighlight()
+        highlightTag = runCatching { area.addLineHighlight(line, syncColor) }.getOrNull()
+        runCatching {
+            val offset = area.getLineStartOffset(line)
+            area.caretPosition = offset
+            area.modelToView(offset)?.let { area.scrollRectToVisible(it) }
+        }
+        area.requestFocusInWindow()
     }
 
     private fun clearHighlight() {

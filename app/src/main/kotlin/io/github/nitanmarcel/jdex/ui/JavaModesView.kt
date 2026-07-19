@@ -4,6 +4,7 @@ import com.formdev.flatlaf.extras.components.FlatTriStateCheckBox.State
 import io.github.nitanmarcel.jdex.project.ApkSession
 import io.github.nitanmarcel.jdex.project.ApkSession.DecompileMode
 import io.github.nitanmarcel.jdex.project.CodeSync
+import io.github.nitanmarcel.jdex.project.Symbol
 import io.github.nitanmarcel.jdex.project.SyncTarget
 import java.awt.BorderLayout
 import javax.swing.JLabel
@@ -16,12 +17,15 @@ class JavaModesView(
     private val onCaret: (SyncTarget) -> Unit,
     private var syncState: State,
     private val onSyncToggle: (State) -> Unit,
+    private val onDefinition: (Symbol) -> Unit = {},
+    private val onFindUsages: (Symbol) -> Unit = {},
 ) : JPanel(BorderLayout()) {
 
     private val modes = DecompileMode.values()
     private val tabs = JTabbedPane()
     private val views = HashMap<DecompileMode, JavaView>()
     private val loading = HashSet<DecompileMode>()
+    private var pendingReveal: SyncTarget? = null
 
     init {
         modes.forEach { tabs.addTab(it.label, JPanel(BorderLayout())) }
@@ -54,9 +58,13 @@ class JavaModesView(
                     diffBaseline = if (mode == DecompileMode.JDEC) {
                         { onResult -> decompile(DecompileMode.JAVA) { onResult(it?.code) } }
                     } else null,
+                    nav = result.nav,
+                    onDefinition = onDefinition,
+                    onFindUsages = onFindUsages,
                 )
                 views[mode] = view
                 container.add(view, BorderLayout.CENTER)
+                if (mode == modes[tabs.selectedIndex]) pendingReveal?.let { view.revealTo(it); pendingReveal = null }
             }
             container.revalidate(); container.repaint()
         }
@@ -70,5 +78,12 @@ class JavaModesView(
 
     fun followTo(target: SyncTarget) {
         views[modes[tabs.selectedIndex]]?.followTo(target)
+    }
+
+    fun revealTo(target: SyncTarget) {
+        val active = modes[tabs.selectedIndex]
+        val view = views[active]
+        if (view != null) view.revealTo(target)
+        else { pendingReveal = target; ensureLoaded(active) }
     }
 }
