@@ -847,6 +847,15 @@ class _Jdex:
         """Bytecode lines matching regex `pattern`, as dicts {method, offset, text}. Expensive full scan, capped at `limit`."""
         return [_as_dict(r) for r in self._host.searchCode(pattern, limit)]
 
+    def set_annotation(self, node, offset, text):
+        """Attach or replace a annotation."""
+        d = node.descriptor if isinstance(node, _Node) else str(node)
+        self._host.setAnnotation(d, int(offset), None if text is None else str(text))
+
+    def clear_annotations(self):
+        """Remove all annotations."""
+        self._host.clearAnnotations()
+
     def manifest(self):
         """Decoded AndroidManifest.xml text, '' if none."""
         return self._host.manifest()

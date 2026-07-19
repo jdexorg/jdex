@@ -184,7 +184,9 @@ class ApkSession private constructor(
             val methods = src.methodsOf(descOf(rawName))
             val dex = runCatching { sd.recoverAll(methods) }.getOrDefault(emptyList())
             val native = nativeDecryptors.flatMap { runCatching { it.recoverCallSites(methods) }.getOrDefault(emptyList()) }
-            dex + native
+            val result = dex + native
+            annotations.batch { for (a in result) setAnnotation(a.descriptor, a.offset, a.text) }
+            result
         }
 
     private fun armNativeLibBytes(): List<ByteArray> {
@@ -324,14 +326,12 @@ class ApkSession private constructor(
             runCatching { rd.fieldSites(m) }.getOrDefault(emptyList()) to runCatching { rd.invokeSites(m) }.getOrDefault(emptyList())
         }
 
-    fun deobBytecodeOverlay(): Map<String, String> {
-        val src = engineSource ?: return emptyMap()
-        val out = HashMap<String, String>()
-        for (a in classRawNames().flatMap { deobStringsForClass(it) }) {
-            val m = src.method(a.descriptor.substringBefore("->"), a.descriptor.substringAfter("->")) ?: continue
-            out["i:%08x".format(m.codeOffset + a.offset * 2)] = a.text
-        }
-        return out
+    val annotations = AnnotationStore()
+
+    fun setAnnotation(descriptor: String, offset: Int, text: String?) {
+        val src = engineSource ?: return
+        val m = src.method(descriptor.substringBefore("->"), descriptor.substringAfter("->")) ?: return
+        annotations.set("i:%08x".format(m.codeOffset + offset * 2), text)
     }
 
     private val jdecJadx by lazy {

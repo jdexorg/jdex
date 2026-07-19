@@ -98,7 +98,7 @@ class VirtualCodeView(
     fun revealSection(name: String): Boolean = source.sectionStart(name)?.let { goToLine(it); true } ?: false
 
     private val commentCache = HashMap<String, String>()
-    private var overlayComments: Map<String, String> = emptyMap()
+    private var annotationCache: Map<String, String> = emptyMap()
     private val bookmarkLines = HashSet<Int>()
     private var highlight: String? = null
     private val backStack = ArrayDeque<Int>()
@@ -125,6 +125,8 @@ class VirtualCodeView(
     private var hoverArrowSrc = -1
     private var hoverArrowTgt = -1
     private var commentColor: Color = Color(0x00, 0x80, 0x00)
+    private var annotationFg: Color = UiColors.info()
+    private var annotationBg: Color = UiColors.alpha(UiColors.info(), 38)
     private var highlightColor: Color = Color(0xFF, 0xD5, 0x4F, 110)
     private var bookmarkColor: Color = Color(0x2E, 0x86, 0xDE)
     private var syncColor = Color(0xFF, 0xD5, 0x4F, 60)
@@ -204,6 +206,8 @@ class VirtualCodeView(
         currentLineColor = SyntaxThemes.editorColor("currentLine") ?: UiColors.alpha(UiColors.accent(), 24)
         hoverColor = Color(foreground.red, foreground.green, foreground.blue, 45)
         commentColor = scheme.getStyle(TokenTypes.COMMENT_EOL)?.foreground ?: Color(0x00, 0x80, 0x00)
+        annotationFg = UiColors.info()
+        annotationBg = UiColors.alpha(UiColors.info(), 38)
         val accent = UiColors.accent()
         highlightColor = UiColors.alpha(accent, 96)
         syncColor = UiColors.alpha(accent, 56)
@@ -685,9 +689,19 @@ class VirtualCodeView(
                 }
                 paintTokens(g, line, y + ascent)
                 anchorOf(raw, index)?.let { anchor ->
-                    (commentCache[anchor] ?: overlayComments[anchor])?.let { c ->
+                    var ax = (line.length + 2) * charWidth - xOffset
+                    annotationCache[anchor]?.let { ann ->
+                        val label = " $ann "
+                        val w = g.fontMetrics.stringWidth(label)
+                        g.color = annotationBg
+                        g.fillRoundRect(ax, y + 2, w, lineHeight - 4, 8, 8)
+                        g.color = annotationFg
+                        g.drawString(label, ax, y + ascent)
+                        ax += w + charWidth
+                    }
+                    commentCache[anchor]?.let { c ->
                         g.color = commentColor
-                        g.drawString("    ; $c", line.length * charWidth - xOffset, y + ascent)
+                        g.drawString("; $c", ax, y + ascent)
                     }
                 }
                 debugInline?.takeIf { index == debugLine }?.let { values ->
@@ -940,8 +954,8 @@ class VirtualCodeView(
         graphView?.refresh()
     }
 
-    fun setOverlayComments(map: Map<String, String>) {
-        overlayComments = map
+    fun setAnnotations(map: Map<String, String>) {
+        annotationCache = map
         rerender()
     }
 

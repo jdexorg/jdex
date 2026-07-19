@@ -374,6 +374,20 @@ class MainWindow : JFrame("jdex") {
         }
     }
 
+    private val annotationPushScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun scheduleAnnotationPush() {
+        if (annotationPushScheduled.compareAndSet(false, true)) {
+            SwingUtilities.invokeLater { annotationPushScheduled.set(false); pushAnnotations() }
+        }
+    }
+
+    private fun pushAnnotations() {
+        val a = session?.annotations?.all() ?: return
+        (sequenceOf(bytecodeView, dexBytecodeView) + nativeViews.asSequence().map { it.second })
+            .filterNotNull().distinct().forEach { it.setAnnotations(a) }
+    }
+
     private fun JMenu.onOpen(block: () -> Unit) = addMenuListener(object : javax.swing.event.MenuListener {
         override fun menuSelected(e: javax.swing.event.MenuEvent) = block()
         override fun menuDeselected(e: javax.swing.event.MenuEvent) {}
@@ -679,6 +693,7 @@ class MainWindow : JFrame("jdex") {
             runCatching { withContext(Dispatchers.Default) { ApkSession.load(input, project.file?.name ?: input.name, project, project, engineConfig) } }
                 .onSuccess { loaded ->
                     session = loaded
+                    loaded.annotations.observe { scheduleAnnotationPush() }
                     debugBar.setAppReady(true)
                     explorer.show(loaded.root)
                     hierarchyClasses = loaded.topClasses()
@@ -964,8 +979,8 @@ class MainWindow : JFrame("jdex") {
                             else activeDbg()?.runToCursor(desc, dexPc)
                         }
                         view.markBreakpoints(breakpointStore().breakpoints().map { it.descriptor to it.dexPc })
-                        session?.let { s -> scope.launch { val ov = runCatching { withContext(Dispatchers.Default) { s.deobBytecodeOverlay() } }.getOrNull() ?: return@launch; view.setOverlayComments(ov) } }
                     }
+                    view.setAnnotations(session?.annotations?.all() ?: emptyMap())
                     view.syncApprox = syncState == FlatTriStateCheckBox.State.INDETERMINATE
                     dockEditorTab(tab)
                     log.info("Opened ${if (content.syntax == Syntax.ASM) "disassembly" else "bytecode"} (${source.lineCount} lines)")

@@ -147,6 +147,10 @@ class ScriptApi(
         onChanged()
     }
 
+    fun setAnnotation(descriptor: String, offset: Int, text: String?) = active().setAnnotation(descriptor, offset, text)
+
+    fun clearAnnotations() = active().annotations.clear()
+
     fun fileNames(): List<String> = active().entryNames()
 
     fun readFile(path: String): ByteArray = active().readFile(path)
